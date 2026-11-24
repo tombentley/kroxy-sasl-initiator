@@ -21,6 +21,7 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -28,6 +29,19 @@ class KeyStorePermissionsTest {
 
     @TempDir
     Path tempDir;
+
+    @Test
+    @EnabledOnOs({ OS.LINUX, OS.MAC })
+    void createsAndRestrictsFilesToOwnerOnly() throws Exception {
+        Path created = KeyStorePermissions.createOwnerOnly(tempDir.resolve("created.p12"));
+        assertThat(Files.getPosixFilePermissions(created)).isEqualTo(PosixFilePermissions.fromString("rw-------"));
+
+        Path written = tempDir.resolve("written.p12");
+        Files.writeString(written, "material");
+        Files.setPosixFilePermissions(written, PosixFilePermissions.fromString("rw-r--r--"));
+        KeyStorePermissions.setOwnerOnly(written);
+        assertThat(Files.getPosixFilePermissions(written)).isEqualTo(PosixFilePermissions.fromString("rw-------"));
+    }
 
     @Test
     @EnabledOnOs({ OS.LINUX, OS.MAC })

@@ -7,6 +7,7 @@
 package com.github.tombentley.kroxylicious.filter.sasl.initiation.credentials;
 
 import java.io.IOException;
+import java.nio.file.FileSystem;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFileAttributeView;
@@ -52,7 +53,67 @@ public final class KeyStorePermissions {
             PosixFilePermission.OTHERS_WRITE,
             PosixFilePermission.OTHERS_EXECUTE);
 
+    private static final Set<PosixFilePermission> OWNER_ONLY = EnumSet.of(
+            PosixFilePermission.OWNER_READ,
+            PosixFilePermission.OWNER_WRITE);
+
     private KeyStorePermissions() {
+    }
+
+    /**
+     * Creates a regular file with owner-only ({@code rw-------}) permissions where the file system supports POSIX
+     * permissions. This fails if the file already exists. On non-POSIX file systems the file is created with the
+     * platform defaults.
+     *
+     * @param path the file to create
+     * @return the created file
+     * @throws IOException if the file cannot be created
+     */
+    public static Path createOwnerOnly(Path path) throws IOException {
+        Objects.requireNonNull(path, "path");
+        if (supportsPosix(path.getFileSystem())) {
+            return Files.createFile(path, PosixFilePermissions.asFileAttribute(OWNER_ONLY));
+        }
+        return Files.createFile(path);
+    }
+
+    /**
+     * Creates a temporary file with owner-only ({@code rw-------}) permissions where the file system supports POSIX
+     * permissions. On non-POSIX file systems the file is created with the platform defaults.
+     *
+     * @param directory the directory in which to create the file
+     * @param prefix the file name prefix
+     * @param suffix the file name suffix
+     * @return the created temporary file
+     * @throws IOException if the file cannot be created
+     */
+    public static Path createTempFileOwnerOnly(Path directory, String prefix, String suffix) throws IOException {
+        Objects.requireNonNull(directory, "directory");
+        Objects.requireNonNull(prefix, "prefix");
+        Objects.requireNonNull(suffix, "suffix");
+        if (supportsPosix(directory.getFileSystem())) {
+            return Files.createTempFile(directory, prefix, suffix, PosixFilePermissions.asFileAttribute(OWNER_ONLY));
+        }
+        return Files.createTempFile(directory, prefix, suffix);
+    }
+
+    /**
+     * Sets owner-only ({@code rw-------}) permissions on an existing file where the file system supports POSIX
+     * permissions. This is a no-op on non-POSIX file systems.
+     *
+     * @param path the file whose permissions should be restricted
+     * @throws IOException if the permissions cannot be changed
+     */
+    public static void setOwnerOnly(Path path) throws IOException {
+        Objects.requireNonNull(path, "path");
+        PosixFileAttributeView posixView = Files.getFileAttributeView(path, PosixFileAttributeView.class);
+        if (posixView != null) {
+            posixView.setPermissions(OWNER_ONLY);
+        }
+    }
+
+    private static boolean supportsPosix(FileSystem fileSystem) {
+        return fileSystem.supportedFileAttributeViews().contains("posix");
     }
 
     /**

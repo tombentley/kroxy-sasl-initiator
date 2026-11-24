@@ -7,7 +7,8 @@
 /**
  * Command line tooling for managing SASL initiation credentials.
  * <p>
- * The commands are added by a later commit. This package currently exists to establish the module and its public
- * package.
+ * The tool manipulates the versioned PKCS12 credential store used by the filter. It never prints passwords, client
+ * secrets, KeyStore aliases or raw entry bytes.
+ * </p>
  */
 package com.github.tombentley.kroxylicious.filter.sasl.initiation.cli;
