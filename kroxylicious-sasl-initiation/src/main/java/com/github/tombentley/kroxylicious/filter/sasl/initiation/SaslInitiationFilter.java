@@ -339,6 +339,10 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
                         return CompletableFuture.failedFuture(new SaslExchangeException(
                                 "The SASL client rejected the broker challenge", e));
                     }
+                    if (nextToken == null && client.isComplete()) {
+                        // SCRAM consumes the broker's final server message and must not send another token.
+                        return CompletableFuture.completedFuture(null);
+                    }
                     return sendAuthenticate(context, client, versions, nextToken == null ? EMPTY_BYTES : nextToken);
                 });
     }

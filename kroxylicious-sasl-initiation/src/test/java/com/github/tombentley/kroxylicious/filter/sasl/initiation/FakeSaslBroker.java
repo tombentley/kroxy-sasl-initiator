@@ -6,10 +6,12 @@
 
 package com.github.tombentley.kroxylicious.filter.sasl.initiation;
 
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
@@ -23,6 +25,12 @@ import javax.security.sasl.SaslServer;
 import org.apache.kafka.common.security.plain.PlainAuthenticateCallback;
 import org.apache.kafka.common.security.plain.internals.PlainSaslServer;
 import org.apache.kafka.common.security.plain.internals.PlainSaslServerProvider;
+import org.apache.kafka.common.security.scram.ScramCredential;
+import org.apache.kafka.common.security.scram.ScramCredentialCallback;
+import org.apache.kafka.common.security.scram.internals.ScramFormatter;
+import org.apache.kafka.common.security.scram.internals.ScramMechanism;
+import org.apache.kafka.common.security.scram.internals.ScramSaslServer;
+import org.apache.kafka.common.security.scram.internals.ScramSaslServerProvider;
 
 import io.kroxylicious.kafka.common.message.ApiVersionsRequestData;
 import io.kroxylicious.kafka.common.message.ApiVersionsResponseData;
@@ -42,11 +50,17 @@ import static com.github.tombentley.kroxylicious.filter.sasl.initiation.TestStor
 
 /**
  * A small fake broker for protocol tests. It answers ApiVersions, SaslHandshake and SaslAuthenticate, using Kafka's
- * {@link PlainSaslServer} for the actual PLAIN challenge/response.
+ * {@link PlainSaslServer} or {@link ScramSaslServer} for the actual challenge/response.
  */
 final class FakeSaslBroker implements MockFilterContext.SendRequestHandler {
 
     static final String BROKER_USERNAME = "broker-alice";
+    private static final int SCRAM_ITERATIONS = 4096;
+
+    static {
+        PlainSaslServerProvider.initialize();
+        ScramSaslServerProvider.initialize();
+    }
 
     private String username = BROKER_USERNAME;
     private String password = BROKER_PASSWORD;
@@ -67,7 +81,7 @@ final class FakeSaslBroker implements MockFilterContext.SendRequestHandler {
      * Creates a fake broker that accepts the default test credential and PLAIN.
      */
     FakeSaslBroker() {
-        PlainSaslServerProvider.initialize();
+        // Providers are registered once by the static initializer above.
     }
 
     FakeSaslBroker withCredentials(String username, String password) {
@@ -79,6 +93,7 @@ final class FakeSaslBroker implements MockFilterContext.SendRequestHandler {
 
     FakeSaslBroker withEnabledMechanisms(String... mechanisms) {
         this.enabledMechanisms = new LinkedHashSet<>(Arrays.asList(mechanisms));
+        this.saslServer = null;
         return this;
     }
 
@@ -152,13 +167,31 @@ final class FakeSaslBroker implements MockFilterContext.SendRequestHandler {
 
     private SaslHandshakeResponseData handshakeResponse(@Nullable String requestedMechanism) {
         if (requestedMechanism == null || !enabledMechanisms.contains(requestedMechanism)) {
-            return new SaslHandshakeResponseData()
-                    .setErrorCode(Errors.UNSUPPORTED_SASL_MECHANISM.code())
-                    .setMechanisms(new ArrayList<>(enabledMechanisms));
+            return handshakeError();
         }
-        saslServer = new PlainSaslServer(callbackHandler());
+        if (PlainSaslServer.PLAIN_MECHANISM.equals(requestedMechanism)) {
+            saslServer = new PlainSaslServer(plainCallbackHandler());
+        }
+        else if (ScramMechanism.isScram(requestedMechanism)) {
+            try {
+                ScramMechanism scramMechanism = ScramMechanism.forMechanismName(requestedMechanism);
+                saslServer = new ScramSaslServer(scramMechanism, Map.of(), scramCallbackHandler(scramMechanism));
+            }
+            catch (NoSuchAlgorithmException e) {
+                throw new IllegalStateException("Could not create the fake SCRAM server", e);
+            }
+        }
+        else {
+            return handshakeError();
+        }
         return new SaslHandshakeResponseData()
                 .setErrorCode(Errors.NONE.code())
+                .setMechanisms(new ArrayList<>(enabledMechanisms));
+    }
+
+    private SaslHandshakeResponseData handshakeError() {
+        return new SaslHandshakeResponseData()
+                .setErrorCode(Errors.UNSUPPORTED_SASL_MECHANISM.code())
                 .setMechanisms(new ArrayList<>(enabledMechanisms));
     }
 
@@ -190,7 +223,7 @@ final class FakeSaslBroker implements MockFilterContext.SendRequestHandler {
         }
     }
 
-    private CallbackHandler callbackHandler() {
+    private CallbackHandler plainCallbackHandler() {
         return callbacks -> {
             String presentedUsername = null;
             PlainAuthenticateCallback authenticateCallback = null;
@@ -206,6 +239,27 @@ final class FakeSaslBroker implements MockFilterContext.SendRequestHandler {
                 boolean authenticated = username.equals(presentedUsername)
                         && Arrays.equals(password.toCharArray(), authenticateCallback.password());
                 authenticateCallback.authenticated(authenticated);
+            }
+        };
+    }
+
+    private CallbackHandler scramCallbackHandler(ScramMechanism mechanism) throws NoSuchAlgorithmException {
+        ScramCredential expectedCredential = new ScramFormatter(mechanism)
+                .generateCredential(password, SCRAM_ITERATIONS);
+        return callbacks -> {
+            String presentedUsername = null;
+            ScramCredentialCallback credentialCallback = null;
+            for (Callback callback : callbacks) {
+                if (callback instanceof NameCallback nameCallback) {
+                    String name = nameCallback.getName();
+                    presentedUsername = name == null ? nameCallback.getDefaultName() : name;
+                }
+                else if (callback instanceof ScramCredentialCallback scramCredentialCallback) {
+                    credentialCallback = scramCredentialCallback;
+                }
+            }
+            if (credentialCallback != null) {
+                credentialCallback.scramCredential(username.equals(presentedUsername) ? expectedCredential : null);
             }
         };
     }
