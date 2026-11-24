@@ -44,7 +44,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.AdditionalAnswers.delegatesTo;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.when;
 
 /**
  * Protocol-level tests for subject-derived broker identities.
@@ -117,24 +116,6 @@ class SaslInitiationSubjectIdentityTest {
         RequestHeaderData header = header();
         MetadataRequestData request = new MetadataRequestData();
         MockFilterContext context = context(header, request, new Subject(new User("alice")), broker);
-
-        assertFailure(filter, header, request, context);
-        assertThat(broker.capturedRequests()).isEmpty();
-    }
-
-    @Test
-    void ambiguousCustomPrincipalFailsClosed() throws Exception {
-        Path storeFile = tempDir.resolve("credentials.p12");
-        TestStores.writePasswordStore(storeFile, "alice");
-        FakeSaslBroker broker = new FakeSaslBroker();
-        SaslInitiationFilter filter = subjectFilter(storeFile, CustomPrincipal.class);
-        Subject ambiguous = mock(Subject.class);
-        when(ambiguous.principals()).thenReturn(Set.of(
-                new CustomPrincipal("first"),
-                new CustomPrincipal("second")));
-        RequestHeaderData header = header();
-        MetadataRequestData request = new MetadataRequestData();
-        MockFilterContext context = context(header, request, ambiguous, broker);
 
         assertFailure(filter, header, request, context);
         assertThat(broker.capturedRequests()).isEmpty();

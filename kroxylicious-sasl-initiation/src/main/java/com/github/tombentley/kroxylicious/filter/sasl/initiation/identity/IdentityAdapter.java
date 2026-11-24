@@ -8,7 +8,6 @@ package com.github.tombentley.kroxylicious.filter.sasl.initiation.identity;
 
 import java.util.Comparator;
 import java.util.LinkedHashSet;
-import java.util.List;
 import java.util.Objects;
 import java.util.Set;
 import java.util.stream.Collectors;
@@ -26,8 +25,12 @@ import io.kroxylicious.proxy.filter.FilterContext;
  * </p>
  * <p>
  * A snapshot is always taken from the supplied request context; this class never caches a subject across requests.
- * Selection fails closed if the subject is anonymous, if the configured principal type is absent, or if more than one
- * principal of that type is present.
+ * Selection fails closed if the subject is anonymous or if the configured principal type is absent.
+ * </p>
+ * <p>
+ * The principal type must be a {@linkplain io.kroxylicious.identity.SingularPrincipals#isSingular(Class) singular}
+ * principal type. That is validated when the identity configuration is resolved, and identity implementations enforce
+ * at most one principal of such a type, so no ambiguity check is needed per request.
  * </p>
  */
 public final class IdentityAdapter {
@@ -53,7 +56,7 @@ public final class IdentityAdapter {
      * @param context the current request context
      * @param principalType the singular principal type whose name is used as the lookup key
      * @return the identity snapshot
-     * @throws IdentitySelectionException if the subject is anonymous, missing the principal type, or ambiguous
+     * @throws IdentitySelectionException if the subject is anonymous or missing the principal type
      */
     @SuppressWarnings({ "deprecation", "removal", "java:S5738" })
     public IdentitySnapshot snapshot(FilterContext context, Class<? extends Principal> principalType) {
@@ -67,36 +70,29 @@ public final class IdentityAdapter {
      * @param identity the authenticated identity
      * @param principalType the singular principal type whose name is used as the lookup key
      * @return the identity snapshot
-     * @throws IdentitySelectionException if the identity is anonymous, missing the principal type, or ambiguous
+     * @throws IdentitySelectionException if the identity is anonymous or missing the principal type
      */
     public IdentitySnapshot snapshot(Identity identity, Class<? extends Principal> principalType) {
         Objects.requireNonNull(principalType, "principalType");
         if (identity == null) {
             throw new IdentitySelectionException(
-                    "No authenticated subject is available; subject identity mode requires an authenticated downstream client");
+                    "No authenticated subject is available; subject identity mode requires an authenticated client");
         }
 
         Set<? extends Principal> allPrincipals = identity.principals();
         if (allPrincipals.isEmpty()) {
             throw new IdentitySelectionException(
-                    "The authenticated subject is anonymous; subject identity mode requires an authenticated downstream client");
+                    "The authenticated subject is anonymous; subject identity mode requires an authenticated client");
         }
 
-        List<? extends Principal> matching = allPrincipals.stream()
+        // The principal type is singular, which was validated when the configuration was resolved, so a valid subject
+        // cannot contain more than one principal of this type.
+        Principal selected = allPrincipals.stream()
                 .filter(principalType::isInstance)
-                .toList();
-        if (matching.isEmpty()) {
-            throw new IdentitySelectionException(
-                    "The authenticated subject has no principal of type " + principalType.getName()
-                            + "; configure identity.principalType to a type present in the downstream subject");
-        }
-        if (matching.size() > 1) {
-            throw new IdentitySelectionException(
-                    "The authenticated subject has " + matching.size() + " principals of type " + principalType.getName()
-                            + "; identity.principalType must identify exactly one principal");
-        }
-
-        Principal selected = matching.get(0);
+                .findFirst()
+                .orElseThrow(() -> new IdentitySelectionException(
+                        "The authenticated subject " + identity + " has no principal of type " + principalType.getName()
+                                + "; configure identity.principalType to a singular principal type guaranteed to be present in the authenticated subject"));
         String lookupKey = selected.name();
         if (lookupKey == null || lookupKey.isBlank()) {
             throw new IdentitySelectionException(
