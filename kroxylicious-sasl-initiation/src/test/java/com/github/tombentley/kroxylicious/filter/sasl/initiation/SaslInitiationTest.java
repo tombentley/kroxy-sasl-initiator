@@ -35,7 +35,6 @@ import io.kroxylicious.kafka.common.message.ApiVersionsResponseData;
 import io.kroxylicious.kafka.common.message.RequestHeaderData;
 import io.kroxylicious.kafka.common.message.ResponseHeaderData;
 import io.kroxylicious.kafka.common.protocol.ApiKeys;
-import io.kroxylicious.proxy.config.secret.InlinePassword;
 import io.kroxylicious.proxy.filter.Filter;
 import io.kroxylicious.proxy.filter.FilterFactory;
 import io.kroxylicious.proxy.filter.FilterFactoryContext;
@@ -195,11 +194,13 @@ class SaslInitiationTest {
     }
 
     @Test
-    void shouldForwardRequestUnchanged() {
+    void shouldForwardApiVersionsRequestUnchanged() throws Exception {
+        Path storeFile = tempDir.resolve("forwarding.p12");
+        TestStores.writePasswordStore(storeFile, "alice");
         RequestHeaderData header = new RequestHeaderData();
         ApiVersionsRequestData request = new ApiVersionsRequestData();
         MockFilterContext filterContext = MockFilterContext.builder(header, request).build();
-        SaslInitiationFilter filter = new SaslInitiationFilter(passThroughConfig());
+        SaslInitiationFilter filter = filter(config(Mechanism.PLAIN, IdentityMode.FIXED, "alice", storeFile, 0.8));
 
         assertThat(filter.onRequest(ApiKeys.API_VERSIONS, (short) 0, header, request, filterContext))
                 .succeedsWithin(Duration.ZERO)
@@ -210,13 +211,15 @@ class SaslInitiationTest {
     }
 
     @Test
-    void shouldForwardResponseUnchanged() {
+    void shouldForwardApiVersionsResponseUnchanged() throws Exception {
+        Path storeFile = tempDir.resolve("forwarding-response.p12");
+        TestStores.writePasswordStore(storeFile, "alice");
         ResponseHeaderData header = new ResponseHeaderData();
         ApiVersionsResponseData response = new ApiVersionsResponseData();
         MockFilterContext filterContext = MockFilterContext.builder(header, response).build();
-        SaslInitiationFilter filter = new SaslInitiationFilter(passThroughConfig());
+        SaslInitiationFilter filter = filter(config(Mechanism.PLAIN, IdentityMode.FIXED, "alice", storeFile, 0.8));
 
-        assertThat(filter.onResponse(ApiKeys.API_VERSIONS, (short) 0, header, response, filterContext))
+        assertThat(filter.onApiVersionsResponse((short) 0, header, response, filterContext))
                 .succeedsWithin(Duration.ZERO)
                 .satisfies(result -> MockFilterContextAssert.assertThat(result)
                         .isForwardResponse()
@@ -236,10 +239,8 @@ class SaslInitiationTest {
                 new ReauthConfig(windowFactor));
     }
 
-    private static SaslInitiationConfig passThroughConfig() {
-        return new SaslInitiationConfig(
-                Mechanism.PLAIN,
-                new IdentityConfig(IdentityMode.FIXED, "alice"),
-                new KeyStoreConfig("/not/read/by/the/pass-through/filter.p12", new InlinePassword("not-used")));
+    private SaslInitiationFilter filter(SaslInitiationConfig config) {
+        SaslInitiationRuntimeConfig runtime = factory.initialize(context, config);
+        return (SaslInitiationFilter) factory.createFilter(context, runtime);
     }
 }

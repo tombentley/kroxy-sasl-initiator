@@ -38,6 +38,7 @@ import io.github.nettyplus.leakdetector.junit.NettyLeakDetectorExtension;
 import io.kroxylicious.testing.integration.config.NamedFilterDefinitionBuilder;
 import io.kroxylicious.testing.kafka.api.KafkaCluster;
 import io.kroxylicious.testing.kafka.common.BrokerCluster;
+import io.kroxylicious.testing.kafka.common.SaslMechanism;
 import io.kroxylicious.testing.kafka.junit5ext.KafkaClusterExtension;
 import io.kroxylicious.testing.kafka.junit5ext.Topic;
 
@@ -65,7 +66,11 @@ class SaslInitiationSmokeIT {
     Path tempDir;
 
     @Test
-    void shouldProduceAndConsumeThroughTheNoOpFilter(@BrokerCluster KafkaCluster cluster, Topic topic) throws Exception {
+    void shouldProduceAndConsumeThroughTheFilter(
+                                                 @SaslMechanism(value = "PLAIN", principals = {
+                                                         @SaslMechanism.Principal(user = "broker-alice", password = "broker-password") }) @BrokerCluster KafkaCluster cluster,
+                                                 Topic topic)
+            throws Exception {
         Path storeFile = writeCredentialStore(tempDir.resolve("credentials.p12"), "alice");
         Path passwordFile = tempDir.resolve("credentials.password");
         Files.writeString(passwordFile, STORE_PASSWORD, StandardCharsets.UTF_8);

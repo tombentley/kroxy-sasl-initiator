@@ -30,8 +30,7 @@ import edu.umd.cs.findbugs.annotations.NonNull;
  * <p>
  * Initialization validates the full configuration, loads and validates the PKCS12 credential store, checks that a
  * fixed identity key exists, and builds the identity selector. Failures therefore happen at startup, before any client
- * connection. The filter itself is still a pass-through in this commit; the SASL protocol state machine is added
- * later.
+ * connection. Each connection gets its own filter instance and SASL exchange state.
  * </p>
  */
 @Plugin(configType = SaslInitiationConfig.class)
@@ -76,7 +75,7 @@ public class SaslInitiation implements FilterFactory<SaslInitiationConfig, SaslI
     @Override
     public Filter createFilter(FilterFactoryContext context, SaslInitiationRuntimeConfig configuration) {
         SaslInitiationRuntimeConfig validated = Plugins.requireConfig(this, configuration);
-        return new SaslInitiationFilter(validated.config());
+        return new SaslInitiationFilter(validated);
     }
 
     @Override
