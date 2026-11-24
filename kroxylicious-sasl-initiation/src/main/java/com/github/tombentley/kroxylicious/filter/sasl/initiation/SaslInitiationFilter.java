@@ -17,11 +17,11 @@ import javax.security.sasl.SaslException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.github.tombentley.kroxylicious.filter.sasl.initiation.config.IdentityMode;
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.config.SaslInitiationConfig;
-import com.github.tombentley.kroxylicious.filter.sasl.initiation.credentials.Credential;
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.credentials.DestroyableSecret;
-import com.github.tombentley.kroxylicious.filter.sasl.initiation.credentials.KeyStoreCredentialStore;
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.credentials.PasswordCredential;
+import com.github.tombentley.kroxylicious.filter.sasl.initiation.identity.IdentityGuard;
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.identity.IdentitySelector;
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.identity.IdentitySnapshot;
 
@@ -64,8 +64,9 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
     private static final byte[] EMPTY_BYTES = new byte[0];
 
     private final SaslInitiationConfig config;
-    private final KeyStoreCredentialStore credentialStore;
+    private final CredentialResolver credentialResolver;
     private final IdentitySelector identitySelector;
+    private final IdentityGuard identityGuard;
     private final MechanismDriver mechanismDriver;
 
     private SaslExchangeState state = new SaslExchangeState.AwaitingTrigger();
@@ -78,8 +79,11 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
      */
     SaslInitiationFilter(SaslInitiationRuntimeConfig runtimeConfig) {
         this.config = runtimeConfig.config();
-        this.credentialStore = runtimeConfig.credentialStore();
+        this.credentialResolver = runtimeConfig.credentialResolver();
         this.identitySelector = runtimeConfig.identitySelector();
+        this.identityGuard = config.identity().mode() == IdentityMode.SUBJECT
+                ? IdentityGuard.forSubject(identitySelector)
+                : IdentityGuard.disabled();
         this.mechanismDriver = new PasswordMechanismDriver(config.mechanism());
     }
 
@@ -115,9 +119,9 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
             }
             case SaslExchangeState.Authenticating authenticating -> authenticating.stage()
                     .thenCompose(result -> result.authenticated()
-                            ? context.forwardRequest(header, request)
+                            ? forwardWithIdentityCheck(context, header, request)
                             : failureResult(context, header, request));
-            case SaslExchangeState.Authenticated ignored -> context.forwardRequest(header, request);
+            case SaslExchangeState.Authenticated ignored -> forwardWithIdentityCheck(context, header, request);
             case SaslExchangeState.Failed ignored -> failureResult(context, header, request);
         };
     }
@@ -192,17 +196,22 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
         });
 
         return stage.thenCompose(result -> result.authenticated()
-                ? context.forwardRequest(header, request)
+                ? forwardWithIdentityCheck(context, header, request)
                 : failureResult(context, header, request));
     }
 
     private CompletionStage<SaslExchangeState.AuthenticationResult> authenticate(FilterContext context) {
+        final IdentitySnapshot identity;
         final PasswordCredential credential;
         try {
-            IdentitySnapshot identity = identitySelector.select(context);
-            Credential selected = credentialStore.require(identity.lookupKey());
-            if (!(selected instanceof PasswordCredential passwordCredential)) {
-                throw new SaslExchangeException("The selected credential is not usable by the configured mechanism");
+            identity = identitySelector.select(context);
+            identityGuard.expect(identity);
+            CredentialResolver.ResolvedCredential resolved = credentialResolver.resolve(
+                    identity.lookupKey(),
+                    config.mechanism().credentialKind());
+            if (!(resolved.credential() instanceof PasswordCredential passwordCredential)) {
+                throw new CredentialResolver.CredentialResolutionException(
+                        "The selected credential is not usable by the configured mechanism");
             }
             credential = passwordCredential;
         }
@@ -211,8 +220,19 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
                     .addKeyValue("mechanism", config.mechanism())
                     .addKeyValue("errorType", e.getClass().getSimpleName())
                     .log("SASL initiation could not select a usable broker credential");
+            LOGGER.atDebug()
+                    .setCause(e)
+                    .log("SASL initiation identity/credential selection detail");
             return CompletableFuture.completedFuture(SaslExchangeState.AuthenticationResult.failure());
         }
+
+        final String subject = identity.lookupKey();
+        final String brokerUsername = credential.username();
+        LOGGER.atDebug()
+                .addKeyValue("mechanism", config.mechanism())
+                .addKeyValue("subject", subject)
+                .addKeyValue("brokerUsername", brokerUsername)
+                .log("Selected the broker credential for SASL initiation");
 
         CompletionStage<Long> exchange = resolveApiVersions(context)
                 .thenCompose(versions -> sendHandshake(context, versions))
@@ -223,9 +243,47 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
                 logExchangeFailure(error);
                 return SaslExchangeState.AuthenticationResult.failure();
             }
+            try {
+                // The subject may have changed while the upstream exchange was in flight. Re-read it before treating
+                // the connection as authenticated; never retry as the new identity.
+                identityGuard.verify(context);
+            }
+            catch (RuntimeException e) {
+                logSubjectChangeFailure(e);
+                return SaslExchangeState.AuthenticationResult.failure();
+            }
+            LOGGER.atInfo()
+                    .addKeyValue("mechanism", config.mechanism())
+                    .addKeyValue("subject", subject)
+                    .addKeyValue("brokerUsername", brokerUsername)
+                    .log("SASL initiation authenticated the upstream connection");
             return SaslExchangeState.AuthenticationResult.success(
                     Objects.requireNonNull(sessionLifetimeMs, "sessionLifetimeMs"));
         });
+    }
+
+    private CompletionStage<RequestFilterResult> forwardWithIdentityCheck(FilterContext context,
+                                                                          RequestHeaderData header,
+                                                                          ApiMessage request) {
+        try {
+            identityGuard.verify(context);
+        }
+        catch (RuntimeException e) {
+            logSubjectChangeFailure(e);
+            state = new SaslExchangeState.Failed();
+            return failureResult(context, header, request);
+        }
+        return context.forwardRequest(header, request);
+    }
+
+    private void logSubjectChangeFailure(Throwable error) {
+        LOGGER.atWarn()
+                .addKeyValue("mechanism", config.mechanism())
+                .addKeyValue("errorType", error.getClass().getSimpleName())
+                .log("The downstream subject is no longer valid for this authenticated upstream connection");
+        LOGGER.atDebug()
+                .setCause(error)
+                .log("Downstream subject change detail");
     }
 
     private CompletionStage<SaslApiVersions> resolveApiVersions(FilterContext context) {

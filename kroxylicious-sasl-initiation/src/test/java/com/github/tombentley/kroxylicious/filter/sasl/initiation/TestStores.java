@@ -36,6 +36,15 @@ final class TestStores {
     private TestStores() {
     }
 
+    /**
+     * A password entry to write to a test store.
+     *
+     * @param subject the lookup subject
+     * @param username the broker authentication id
+     * @param password the broker password
+     */
+    record PasswordEntry(String subject, String username, String password) {}
+
     static PasswordProvider passwordProvider(String password) {
         return () -> password;
     }
@@ -45,14 +54,21 @@ final class TestStores {
     }
 
     static void writePasswordStore(Path file, String... subjects) throws Exception {
+        PasswordEntry[] entries = Arrays.stream(subjects)
+                .map(subject -> new PasswordEntry(subject, "broker-" + subject, BROKER_PASSWORD))
+                .toArray(PasswordEntry[]::new);
+        writePasswordStore(file, entries);
+    }
+
+    static void writePasswordStore(Path file, PasswordEntry... entries) throws Exception {
         KeyStore keyStore = KeyStore.getInstance("PKCS12");
         char[] password = STORE_PASSWORD.toCharArray();
         KeyStore.PasswordProtection protection = new KeyStore.PasswordProtection(password);
         try {
             keyStore.load(null, password);
-            for (String subject : subjects) {
-                byte[] json = passwordEntryJson(subject, "broker-" + subject, BROKER_PASSWORD);
-                keyStore.setEntry(SubjectAlias.hash(subject),
+            for (PasswordEntry entry : entries) {
+                byte[] json = passwordEntryJson(entry.subject(), entry.username(), entry.password());
+                keyStore.setEntry(SubjectAlias.hash(entry.subject()),
                         new KeyStore.SecretKeyEntry(new SecretKeySpec(json, "AES")),
                         protection);
                 Arrays.fill(json, (byte) 0);

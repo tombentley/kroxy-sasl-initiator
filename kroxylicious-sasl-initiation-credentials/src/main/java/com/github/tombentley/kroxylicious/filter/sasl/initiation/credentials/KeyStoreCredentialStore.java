@@ -58,12 +58,16 @@ public final class KeyStoreCredentialStore implements AutoCloseable {
 
     private static final String KEYSTORE_TYPE = "PKCS12";
 
-    private final Map<String, Credential> credentials;
+    private final Map<String, StoredCredential> credentials;
+    private final Map<String, Credential> credentialView;
     private final CredentialKind kind;
     private final Path file;
 
-    private KeyStoreCredentialStore(Map<String, Credential> credentials, CredentialKind kind, Path file) {
+    private KeyStoreCredentialStore(Map<String, StoredCredential> credentials, CredentialKind kind, Path file) {
         this.credentials = Collections.unmodifiableMap(new LinkedHashMap<>(credentials));
+        Map<String, Credential> view = new LinkedHashMap<>();
+        this.credentials.forEach((subject, stored) -> view.put(subject, stored.credential()));
+        this.credentialView = Collections.unmodifiableMap(view);
         this.kind = kind;
         this.file = file;
     }
@@ -110,7 +114,7 @@ public final class KeyStoreCredentialStore implements AutoCloseable {
             protection = new KeyStore.PasswordProtection(storePassword);
             List<DecodedEntry> entries = decodeEntries(keyStore, protection, expectedKind);
             rejectDuplicateSubjects(entries);
-            Map<String, Credential> loaded = buildCredentials(entries);
+            Map<String, StoredCredential> loaded = buildCredentials(entries);
             LOGGER.atInfo()
                     .addKeyValue("file", file)
                     .addKeyValue("credentialKind", expectedKind)
@@ -149,7 +153,7 @@ public final class KeyStoreCredentialStore implements AutoCloseable {
      * @return the credentials keyed by subject
      */
     public Map<String, Credential> credentials() {
-        return credentials;
+        return credentialView;
     }
 
     /**
@@ -177,6 +181,16 @@ public final class KeyStoreCredentialStore implements AutoCloseable {
      * @return the credential, or empty if no entry exists
      */
     public Optional<Credential> find(String key) {
+        return findStored(key).map(StoredCredential::credential);
+    }
+
+    /**
+     * Finds a credential and its stored subject by subject.
+     *
+     * @param key the subject lookup key
+     * @return the stored credential, or empty if no entry exists
+     */
+    public Optional<StoredCredential> findStored(String key) {
         Objects.requireNonNull(key, "key");
         return Optional.ofNullable(credentials.get(key));
     }
@@ -190,14 +204,25 @@ public final class KeyStoreCredentialStore implements AutoCloseable {
      * @throws KeyStoreCredentialStoreException if no entry exists for the key
      */
     public Credential require(String key) {
+        return requireStored(key).credential();
+    }
+
+    /**
+     * Returns a credential and its stored subject by subject, failing if it is absent.
+     *
+     * @param key the subject lookup key
+     * @return the stored credential
+     * @throws KeyStoreCredentialStoreException if no entry exists for the key
+     */
+    public StoredCredential requireStored(String key) {
         Objects.requireNonNull(key, "key");
-        Credential credential = credentials.get(key);
-        if (credential == null) {
+        StoredCredential stored = credentials.get(key);
+        if (stored == null) {
             throw new KeyStoreCredentialStoreException(
                     "No " + kind + " credential is configured for key '" + key + "' in " + file
                             + "; add the entry or correct the configured identity key");
         }
-        return credential;
+        return stored;
     }
 
     /**
@@ -206,7 +231,7 @@ public final class KeyStoreCredentialStore implements AutoCloseable {
      */
     @Override
     public void close() {
-        credentials.values().forEach(Credential::destroy);
+        credentials.values().forEach(stored -> stored.credential().destroy());
     }
 
     @Override
@@ -315,8 +340,8 @@ public final class KeyStoreCredentialStore implements AutoCloseable {
         }
     }
 
-    private static Map<String, Credential> buildCredentials(List<DecodedEntry> entries) {
-        Map<String, Credential> loaded = new LinkedHashMap<>();
+    private static Map<String, StoredCredential> buildCredentials(List<DecodedEntry> entries) {
+        Map<String, StoredCredential> loaded = new LinkedHashMap<>();
         boolean complete = false;
         try {
             for (DecodedEntry decoded : entries) {
@@ -326,14 +351,15 @@ public final class KeyStoreCredentialStore implements AutoCloseable {
                             "KeyStore alias '" + decoded.alias() + "' does not match the SHA-256 hash of its subject; expected '"
                                     + expectedAlias + "'. The KeyStore may be corrupted or created by an incompatible tool.");
                 }
-                loaded.put(decoded.entry().subject(), decoded.entry().toCredential());
+                loaded.put(decoded.entry().subject(),
+                        new StoredCredential(decoded.entry().subject(), decoded.entry().toCredential()));
             }
             complete = true;
             return loaded;
         }
         finally {
             if (!complete) {
-                loaded.values().forEach(Credential::destroy);
+                loaded.values().forEach(stored -> stored.credential().destroy());
             }
         }
     }
