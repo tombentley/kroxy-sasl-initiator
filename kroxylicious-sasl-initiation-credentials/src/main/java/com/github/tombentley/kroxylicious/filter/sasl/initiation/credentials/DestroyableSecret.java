@@ -9,6 +9,8 @@ package com.github.tombentley.kroxylicious.filter.sasl.initiation.credentials;
 import java.util.Arrays;
 import java.util.Objects;
 
+import edu.umd.cs.findbugs.annotations.Nullable;
+
 /**
  * A secret held in a mutable {@code char[]} or {@code byte[]} that can be zeroized deterministically.
  * <p>
@@ -28,8 +30,9 @@ public final class DestroyableSecret implements AutoCloseable {
 
     private static final String REDACTED = "REDACTED";
 
-    private char[] chars;
-    private byte[] bytes;
+    private final Object lock = new Object();
+    private @Nullable char[] chars;
+    private @Nullable byte[] bytes;
     private boolean destroyed;
 
     private DestroyableSecret(char[] chars) {
@@ -78,14 +81,16 @@ public final class DestroyableSecret implements AutoCloseable {
      * @return a defensive copy of the secret characters
      * @throws IllegalStateException if the secret has been destroyed or holds byte material
      */
-    public synchronized char[] chars() {
-        if (destroyed) {
-            throw new IllegalStateException("Secret has already been destroyed");
+    public char[] chars() {
+        synchronized (lock) {
+            if (destroyed) {
+                throw new IllegalStateException("Secret has already been destroyed");
+            }
+            if (chars == null) {
+                throw new IllegalStateException("Secret does not contain character data");
+            }
+            return chars.clone();
         }
-        if (chars == null) {
-            throw new IllegalStateException("Secret does not contain character data");
-        }
-        return chars.clone();
     }
 
     /**
@@ -94,14 +99,16 @@ public final class DestroyableSecret implements AutoCloseable {
      * @return a defensive copy of the secret bytes
      * @throws IllegalStateException if the secret has been destroyed or holds character material
      */
-    public synchronized byte[] bytes() {
-        if (destroyed) {
-            throw new IllegalStateException("Secret has already been destroyed");
+    public byte[] bytes() {
+        synchronized (lock) {
+            if (destroyed) {
+                throw new IllegalStateException("Secret has already been destroyed");
+            }
+            if (bytes == null) {
+                throw new IllegalStateException("Secret does not contain byte data");
+            }
+            return bytes.clone();
         }
-        if (bytes == null) {
-            throw new IllegalStateException("Secret does not contain byte data");
-        }
-        return bytes.clone();
     }
 
     /**
@@ -109,11 +116,13 @@ public final class DestroyableSecret implements AutoCloseable {
      *
      * @return the number of characters or bytes
      */
-    public synchronized int length() {
-        if (destroyed) {
-            return 0;
+    public int length() {
+        synchronized (lock) {
+            if (destroyed) {
+                return 0;
+            }
+            return chars != null ? chars.length : bytes.length;
         }
-        return chars != null ? chars.length : bytes.length;
     }
 
     /**
@@ -121,26 +130,30 @@ public final class DestroyableSecret implements AutoCloseable {
      *
      * @return {@code true} if the material has been zeroized
      */
-    public synchronized boolean isDestroyed() {
-        return destroyed;
+    public boolean isDestroyed() {
+        synchronized (lock) {
+            return destroyed;
+        }
     }
 
     /**
      * Zeroizes the secret material. Calling this method more than once has no additional effect.
      */
-    public synchronized void destroy() {
-        if (destroyed) {
-            return;
+    public void destroy() {
+        synchronized (lock) {
+            if (destroyed) {
+                return;
+            }
+            if (chars != null) {
+                Arrays.fill(chars, '\0');
+            }
+            if (bytes != null) {
+                Arrays.fill(bytes, (byte) 0);
+            }
+            chars = null;
+            bytes = null;
+            destroyed = true;
         }
-        if (chars != null) {
-            Arrays.fill(chars, '\0');
-        }
-        if (bytes != null) {
-            Arrays.fill(bytes, (byte) 0);
-        }
-        chars = null;
-        bytes = null;
-        destroyed = true;
     }
 
     @Override

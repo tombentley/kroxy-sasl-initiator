@@ -31,6 +31,8 @@ import org.slf4j.LoggerFactory;
 import io.kroxylicious.proxy.config.secret.FilePassword;
 import io.kroxylicious.proxy.config.secret.PasswordProvider;
 
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
+
 /**
  * An immutable in-memory credential store loaded from a PKCS12 KeyStore.
  * <p>
@@ -76,6 +78,7 @@ public final class KeyStoreCredentialStore implements AutoCloseable {
      * @throws KeyStoreCredentialStoreException if the file is missing, unreadable, not PKCS12, has insecure
      *             permissions, has an incorrect password, or contains an invalid entry
      */
+    @SuppressFBWarnings(value = "RCN_REDUNDANT_NULLCHECK_OF_NONNULL_VALUE", justification = "PasswordProvider is implemented by users; keep the defensive null check")
     public static KeyStoreCredentialStore load(Path file, PasswordProvider filePassword, CredentialKind expectedKind) {
         Objects.requireNonNull(file, "file");
         Objects.requireNonNull(filePassword, "filePassword");
@@ -314,6 +317,7 @@ public final class KeyStoreCredentialStore implements AutoCloseable {
 
     private static Map<String, Credential> buildCredentials(List<DecodedEntry> entries) {
         Map<String, Credential> loaded = new LinkedHashMap<>();
+        boolean complete = false;
         try {
             for (DecodedEntry decoded : entries) {
                 String expectedAlias = SubjectAlias.hash(decoded.entry().subject());
@@ -324,11 +328,13 @@ public final class KeyStoreCredentialStore implements AutoCloseable {
                 }
                 loaded.put(decoded.entry().subject(), decoded.entry().toCredential());
             }
+            complete = true;
             return loaded;
         }
-        catch (RuntimeException e) {
-            loaded.values().forEach(Credential::destroy);
-            throw e;
+        finally {
+            if (!complete) {
+                loaded.values().forEach(Credential::destroy);
+            }
         }
     }
 

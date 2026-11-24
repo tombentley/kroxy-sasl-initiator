@@ -8,6 +8,7 @@ package com.github.tombentley.kroxylicious.filter.sasl.initiation.cli;
 
 import java.nio.file.Path;
 
+import edu.umd.cs.findbugs.annotations.Nullable;
 import picocli.CommandLine.Option;
 
 /**
@@ -16,6 +17,7 @@ import picocli.CommandLine.Option;
 final class EntrySecretOptions {
 
     @Option(names = { "--password-file", "--client-secret-file" }, paramLabel = "<path>", description = "Read the secret from the first line of the given file.")
+    @Nullable
     Path passwordFile;
 
     @Option(names = { "--password-stdin", "--client-secret-stdin" }, description = "Read the secret from the first line of standard input.")
@@ -24,6 +26,7 @@ final class EntrySecretOptions {
     @Option(names = { "--password",
             "--client-secret" }, paramLabel = "<secret>", description = "Pass the secret as an argument. Requires --insecure-allow-password-argument. "
                     + "SECURITY WARNING: command-line arguments are exposed in process listings and shell history.")
+    @Nullable
     String password;
 
     void validate(boolean allowPasswordArgument) {

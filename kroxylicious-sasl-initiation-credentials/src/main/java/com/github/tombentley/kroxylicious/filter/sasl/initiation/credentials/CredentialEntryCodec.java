@@ -21,6 +21,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.json.JsonMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
+import edu.umd.cs.findbugs.annotations.Nullable;
+
 /**
  * Encodes and decodes the version 1 KeyStore entry JSON.
  * <p>
@@ -122,7 +124,7 @@ public final class CredentialEntryCodec {
         }
     }
 
-    private static CredentialEntry decode(JsonNode root) {
+    private static CredentialEntry decode(@Nullable JsonNode root) {
         if (root == null || root.isNull() || !root.isObject()) {
             throw invalid("the JSON value must be an object");
         }

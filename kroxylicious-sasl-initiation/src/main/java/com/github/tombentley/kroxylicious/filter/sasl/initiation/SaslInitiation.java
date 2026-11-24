@@ -37,6 +37,6 @@ public class SaslInitiation implements FilterFactory<SaslInitiationConfig, SaslI
 
     @Override
     public Filter createFilter(FilterFactoryContext context, SaslInitiationConfig configuration) {
-        return new SaslInitiationFilter(configuration);
+        return new SaslInitiationFilter(Plugins.requireConfig(this, configuration));
     }
 }

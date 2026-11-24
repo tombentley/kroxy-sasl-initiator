@@ -15,6 +15,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Objects;
 
+import edu.umd.cs.findbugs.annotations.Nullable;
+
 /**
  * Reads secrets from an interactive console, a file or standard input.
  * <p>
@@ -30,11 +32,11 @@ final class SecretInput {
 
     static char[] read(String label,
                        String fileOption,
-                       Path file,
+                       @Nullable Path file,
                        String stdinOption,
                        boolean stdin,
                        String argumentOption,
-                       String argument,
+                       @Nullable String argument,
                        boolean allowArgument,
                        String consolePrompt) {
         Objects.requireNonNull(label, "label");
@@ -55,11 +57,11 @@ final class SecretInput {
     }
 
     static void validate(String fileOption,
-                         Path file,
+                         @Nullable Path file,
                          String stdinOption,
                          boolean stdin,
                          String argumentOption,
-                         String argument,
+                         @Nullable String argument,
                          boolean allowArgument) {
         int sources = (file == null ? 0 : 1) + (stdin ? 1 : 0) + (argument == null ? 0 : 1);
         if (sources > 1) {

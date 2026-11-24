@@ -35,6 +35,15 @@ mvn verify
 This compiles all modules, runs unit tests (`*Test` via Surefire), runs integration tests (`*IT` via Failsafe), and
 checks formatting, import order, license headers and Checkstyle rules.
 
+Static analysis is opt-in because it is slower:
+
+```shell
+mvn -Pspotbugs verify
+```
+
+The `spotbugs` profile runs SpotBugs at maximum effort with the low threshold and fails the build on any finding in
+production classes. CI runs this profile as well.
+
 Formatting and license checks are validation-only by default. To apply the fixes locally:
 
 ```shell

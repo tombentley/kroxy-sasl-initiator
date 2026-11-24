@@ -59,6 +59,7 @@
         <jackson.version>2.22.4</jackson.version>
         <picocli.version>4.7.7</picocli.version>
         <slf4j.version>2.0.20</slf4j.version>
+        <spotbugs-annotations.version>4.10.5</spotbugs-annotations.version>
         <netty-leak-detector.version>0.2.2</netty-leak-detector.version>
 
         <!-- Maven plugin versions -->
@@ -68,6 +69,7 @@
         <maven.enforcer.version>3.7.0</maven.enforcer.version>
         <maven.checkstyle.version>3.6.0</maven.checkstyle.version>
         <maven.shade.version>3.6.1</maven.shade.version>
+        <spotbugs-maven-plugin.version>4.10.5.0</spotbugs-maven-plugin.version>
         <checkstyle.version>14.4.0</checkstyle.version>
         <formatter-maven-plugin.version>2.29.0</formatter-maven-plugin.version>
         <impsort-maven-plugin.version>1.13.0</impsort-maven-plugin.version>
@@ -163,6 +165,12 @@
                 <groupId>org.slf4j</groupId>
                 <artifactId>slf4j-api</artifactId>
                 <version>${slf4j.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.github.spotbugs</groupId>
+                <artifactId>spotbugs-annotations</artifactId>
+                <version>${spotbugs-annotations.version}</version>
+                <scope>provided</scope>
             </dependency>
             <dependency>
                 <groupId>info.picocli</groupId>
@@ -382,6 +390,18 @@
                         </execution>
                     </executions>
                 </plugin>
+                <plugin>
+                    <groupId>com.github.spotbugs</groupId>
+                    <artifactId>spotbugs-maven-plugin</artifactId>
+                    <version>${spotbugs-maven-plugin.version}</version>
+                    <configuration>
+                        <effort>Max</effort>
+                        <threshold>Low</threshold>
+                        <xmlOutput>true</xmlOutput>
+                        <failOnError>true</failOnError>
+                        <includeTests>false</includeTests>
+                    </configuration>
+                </plugin>
             </plugins>
         </pluginManagement>
 
@@ -505,6 +525,30 @@
                             <violationSeverity>warning</violationSeverity>
                             <failOnViolation>true</failOnViolation>
                         </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+        <profile>
+            <id>spotbugs</id>
+            <!--
+                Static analysis is opt-in because it is slow. Active with -Pspotbugs: the build fails when SpotBugs
+                reports any finding at the configured effort/threshold.
+            -->
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>com.github.spotbugs</groupId>
+                        <artifactId>spotbugs-maven-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>spotbugs-check</id>
+                                <phase>verify</phase>
+                                <goals>
+                                    <goal>check</goal>
+                                </goals>
+                            </execution>
+                        </executions>
                     </plugin>
                 </plugins>
             </build>

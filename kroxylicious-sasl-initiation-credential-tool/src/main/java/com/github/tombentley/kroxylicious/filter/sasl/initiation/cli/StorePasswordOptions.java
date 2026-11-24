@@ -8,6 +8,7 @@ package com.github.tombentley.kroxylicious.filter.sasl.initiation.cli;
 
 import java.nio.file.Path;
 
+import edu.umd.cs.findbugs.annotations.Nullable;
 import picocli.CommandLine.Option;
 
 /**
@@ -16,6 +17,7 @@ import picocli.CommandLine.Option;
 final class StorePasswordOptions {
 
     @Option(names = "--store-password-file", paramLabel = "<path>", description = "Read the store password from the first line of the given file.")
+    @Nullable
     Path storePasswordFile;
 
     @Option(names = "--store-password-stdin", description = "Read the store password from the first line of standard input.")
@@ -23,6 +25,7 @@ final class StorePasswordOptions {
 
     @Option(names = "--store-password", paramLabel = "<password>", description = "Pass the store password as an argument. Requires --insecure-allow-password-argument. "
             + "SECURITY WARNING: command-line arguments are exposed in process listings and shell history.")
+    @Nullable
     String storePassword;
 
     void validate(boolean allowPasswordArgument) {

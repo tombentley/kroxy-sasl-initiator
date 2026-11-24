@@ -11,6 +11,7 @@ import java.util.Arrays;
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.credentials.CredentialEntry;
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.credentials.OAuthCredentialEntry;
 
+import edu.umd.cs.findbugs.annotations.Nullable;
 import picocli.CommandLine;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Mixin;
@@ -41,6 +42,7 @@ final class AddOAuthCommand extends AbstractCommand {
     String clientId;
 
     @Option(names = "--expected-subject", paramLabel = "<subject>", description = "The token subject claim value to verify. Defaults to the credential subject.")
+    @Nullable
     String expectedSubject;
 
     @Override

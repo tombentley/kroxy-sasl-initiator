@@ -28,4 +28,4 @@ jobs:
           cache: maven
 
       - name: Run the build
-        run: mvn -B -ntp verify
+        run: mvn -B -ntp -Pci,spotbugs verify

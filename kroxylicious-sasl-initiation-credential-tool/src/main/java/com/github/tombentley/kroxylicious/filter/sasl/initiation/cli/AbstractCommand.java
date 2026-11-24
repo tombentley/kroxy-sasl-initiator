@@ -13,6 +13,7 @@ import java.util.concurrent.Callable;
 
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.credentials.KeyStoreCredentialStoreException;
 
+import edu.umd.cs.findbugs.annotations.Nullable;
 import picocli.CommandLine;
 import picocli.CommandLine.Model.CommandSpec;
 import picocli.CommandLine.Spec;
@@ -67,7 +68,7 @@ abstract class AbstractCommand implements Callable<Integer> {
      * @return the picocli exit code
      * @throws Exception on an expected failure
      */
-    protected abstract int execute() throws Exception;
+    protected abstract int execute() throws IOException, GeneralSecurityException;
 
     protected final PrintWriter out() {
         return spec.commandLine().getOut();
@@ -77,7 +78,7 @@ abstract class AbstractCommand implements Callable<Integer> {
         return spec.commandLine().getErr();
     }
 
-    protected static void requireNonBlank(String value, String option) {
+    protected static void requireNonBlank(@Nullable String value, String option) {
         if (value == null || value.isBlank()) {
             throw new UsageException(option + " must not be blank");
         }

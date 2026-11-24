@@ -6,7 +6,7 @@
 
 package com.github.tombentley.kroxylicious.filter.sasl.initiation.credentials;
 
-import java.util.Objects;
+import edu.umd.cs.findbugs.annotations.Nullable;
 
 /**
  * Shared validation helpers for credential model types. Messages name fields but never include field values that may
@@ -25,23 +25,27 @@ final class CredentialValidation {
         return version;
     }
 
-    static String requireNonBlank(String value, String field) {
-        Objects.requireNonNull(value, "Credential entry field '" + field + "' must not be null");
+    static String requireNonBlank(@Nullable String value, String field) {
+        if (value == null) {
+            throw new NullPointerException("Credential entry field '" + field + "' must not be null");
+        }
         if (value.isBlank()) {
             throw new IllegalArgumentException("Credential entry field '" + field + "' must not be blank");
         }
         return value;
     }
 
-    static String requireNonEmpty(String value, String field) {
-        Objects.requireNonNull(value, "Credential entry field '" + field + "' must not be null");
+    static String requireNonEmpty(@Nullable String value, String field) {
+        if (value == null) {
+            throw new NullPointerException("Credential entry field '" + field + "' must not be null");
+        }
         if (value.isEmpty()) {
             throw new IllegalArgumentException("Credential entry field '" + field + "' must not be empty");
         }
         return value;
     }
 
-    static String requireSecret(String value, String field) {
+    static String requireSecret(@Nullable String value, String field) {
         return requireNonEmpty(value, field);
     }
 }

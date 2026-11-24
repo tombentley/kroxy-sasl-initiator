@@ -20,6 +20,8 @@ import java.util.Set;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import edu.umd.cs.findbugs.annotations.Nullable;
+
 /**
  * Checks that credential files are not accessible to group or other users on POSIX file systems.
  * <p>
@@ -135,7 +137,7 @@ public final class KeyStorePermissions {
      * @param allowInsecureValue the value to treat as the escape-hatch setting
      * @throws KeyStoreCredentialStoreException if the file is group- or other-accessible on a POSIX file system
      */
-    static void check(Path path, String allowInsecureValue) {
+    static void check(Path path, @Nullable String allowInsecureValue) {
         Objects.requireNonNull(path, "path");
         if (isAllowInsecure(allowInsecureValue)) {
             LOGGER.atWarn()
@@ -167,7 +169,7 @@ public final class KeyStorePermissions {
         }
     }
 
-    private static boolean isAllowInsecure(String value) {
+    private static boolean isAllowInsecure(@Nullable String value) {
         return value != null && "true".equalsIgnoreCase(value.trim());
     }
 }

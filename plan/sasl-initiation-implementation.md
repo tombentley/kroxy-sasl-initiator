@@ -30,6 +30,15 @@ that leaves the build green, adds tests for the behaviour it introduces, and doe
   mvn verify -Pci
   ```
 
+  Static analysis is opt-in because it is slower. Before merge, also run:
+
+  ```shell
+  mvn verify -Pspotbugs
+  ```
+
+  The `spotbugs` profile runs SpotBugs at maximum effort with the low threshold and fails the build on any finding.
+  CI enables it alongside `-Pci`.
+
   Integration tests that need Docker must be skipped cleanly when Docker is unavailable; CI runs them with Docker.
 * The plan deliberately keeps runtime/API changes to Kroxylicious out of scope. If a commit discovers that a runtime
   change is unavoidable, stop and record it as a blocker in §8 rather than silently depending on a snapshot.
@@ -54,6 +63,9 @@ These apply to every commit:
   Kroxylicious 0.26.0 shades these; do **not** import `org.apache.kafka.common.message.*` in filter code.
 * Kafka's SASL client APIs remain in `org.apache.kafka.common.security.*`.
 * Add the Apache-2.0 license header to every new source file. Follow the Kroxylicious formatter/import order.
+* Document nullness with the SpotBugs annotations (see §2.4). Every package has a `package-info.java` that makes
+  `@NonNull` the default, so code only adds `@Nullable` where a value may genuinely be null. Do not scatter redundant
+  `@NonNull` annotations through the code.
 
 ---
 
@@ -139,6 +151,44 @@ com.github.tombentley.kroxylicious.filter.sasl.initiation.cli           # CLI (i
    | `io.kroxylicious:kroxylicious-certificate-test-support` / extension `KeytoolCertificateGenerator` | mTLS certificates |
    | `io.kroxylicious.testing:testing-junit5-extension` + `testing-impl` | Real Kafka broker provisioning, `@SaslMechanism`, `@BrokerConfig`, `@Tls` |
    | `io.kroxylicious:kroxylicious-kafka-message-json` | Protocol message assertions/JSON fixtures where useful |
+
+### 2.4 Nullness annotations
+
+Nullness is documented with the SpotBugs annotations (`com.github.spotbugs:spotbugs-annotations`, `provided` scope,
+version managed by the parent POM). Every Java package, including test-only packages, must have a `package-info.java`
+with the package-level defaults:
+
+```java
+@ReturnValuesAreNonnullByDefault
+@DefaultAnnotationForParameters(NonNull.class)
+@DefaultAnnotation(NonNull.class)
+package com.github.tombentley.kroxylicious.filter.sasl.initiation.example;
+
+import edu.umd.cs.findbugs.annotations.DefaultAnnotation;
+import edu.umd.cs.findbugs.annotations.DefaultAnnotationForParameters;
+import edu.umd.cs.findbugs.annotations.NonNull;
+import edu.umd.cs.findbugs.annotations.ReturnValuesAreNonnullByDefault;
+```
+
+Rules:
+
+* Fields, method return values and parameters are non-null by default. Do not add `@NonNull` to them.
+* Add `@edu.umd.cs.findbugs.annotations.Nullable` only where null is genuinely accepted or returned. Examples are
+  optional inputs that may be absent, record components that model an optional JSON field, and internal buffers that
+  are cleared after destruction.
+* Treat framework-injected fields (for example picocli `@Spec` and `@Option` fields) as non-null once the framework has
+  initialized them; do not annotate them merely because they are null before injection.
+* SpotBugs cannot see framework injection. Where it reports `NP_NONNULL_FIELD_NOT_INITIALIZED_IN_CONSTRUCTOR` for such a
+  field, add a narrow, justified `@SuppressFBWarnings` rather than weakening the package defaults. The CLI package uses
+  one package-level suppression because every affected field is populated by picocli before the command runs.
+* Once a value has been validated or defaulted (for example in a record compact constructor), the stored value and its
+  accessor should be non-null. Do not publish `@Nullable` accessors for values the constructor guarantees.
+* Annotate the narrowest element that is nullable. For a record component, put `@Nullable` on the component so the
+  accessor, field and canonical-constructor parameter all carry it.
+* Tests follow the same convention. Test classes that live in a production package inherit that package's
+  `package-info.java`; do not add a second `package-info.java` for the same package under `src/test/java`. Test-only
+  packages (for example the integration-test package) still get their own file, and nullable test inputs still use
+  `@Nullable`.
 
 ---
 
@@ -403,6 +453,7 @@ context, though the agent should still read `plan/sasl-initiation.md` and this s
 * A minimal `SaslInitiation` filter factory with `@Plugin(configType = SaslInitiationConfig.class)`, a placeholder
   `SaslInitiationConfig` containing only `mechanism`, and a filter that forwards every request/response unchanged.
 * `META-INF/services/io.kroxylicious.proxy.filter.FilterFactory`.
+* `package-info.java` files for every package, carrying the nullness defaults from §2.4.
 * A smoke integration test that configures the no-op filter on a plain Kafka cluster and produces/consumes a record.
 * GitHub Actions workflow for `mvn verify`.
 * README with build/run/test instructions.
@@ -452,6 +503,10 @@ Requirements:
 - Add a GitHub Actions workflow that runs `mvn verify`.
 - Add a README describing the project, modules, and how to run unit/IT tests.
 - Add Apache-2.0 license headers to all source files.
+- Add `package-info.java` for every package, including test-only packages, with the nullness annotations from §2.4:
+  `@DefaultAnnotation(NonNull.class)`, `@DefaultAnnotationForParameters(NonNull.class)` and
+  `@ReturnValuesAreNonnullByDefault`. Add `com.github.spotbugs:spotbugs-annotations` as a `provided` dependency
+  (managed in the parent POM).
 
 Do not implement KeyStore, credentials, identity selection, SASL protocol, reauthentication, CLI commands or OAUTH in
 this commit. Do not use `0.27.0-SNAPSHOT`. Do not import `org.apache.kafka.common.message.*` in filter code.

@@ -6,6 +6,7 @@
 
 package com.github.tombentley.kroxylicious.filter.sasl.initiation.cli;
 
+import java.security.GeneralSecurityException;
 import java.security.KeyStore;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -43,7 +44,7 @@ final class ListCommand extends AbstractCommand {
     StorePasswordOptions storePasswordOptions;
 
     @Override
-    protected int execute() throws Exception {
+    protected int execute() throws GeneralSecurityException {
         boolean allowPasswordArgument = insecureOptions.insecureAllowPasswordArgument;
         storePasswordOptions.validate(allowPasswordArgument);
         char[] storePassword = storePasswordOptions.resolve(allowPasswordArgument);

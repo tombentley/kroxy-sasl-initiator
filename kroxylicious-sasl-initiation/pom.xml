@@ -52,6 +52,10 @@
             <artifactId>micrometer-core</artifactId>
             <scope>provided</scope>
         </dependency>
+        <dependency>
+            <groupId>com.github.spotbugs</groupId>
+            <artifactId>spotbugs-annotations</artifactId>
+        </dependency>
 
         <!-- Test dependencies -->
         <dependency>

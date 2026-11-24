@@ -8,6 +8,8 @@ package com.github.tombentley.kroxylicious.filter.sasl.initiation.credentials;
 
 import java.util.Objects;
 
+import edu.umd.cs.findbugs.annotations.Nullable;
+
 /**
  * A version 1 OAuth client credential entry.
  *
@@ -59,7 +61,7 @@ public record OAuthCredentialEntry(int version, String subject, OAuthBearer oaut
      * @param clientSecret the OAuth client secret
      * @param expectedSubject the expected token subject; if absent in JSON, defaults to the entry subject
      */
-    public record OAuthBearer(String clientId, String clientSecret, String expectedSubject) {
+    public record OAuthBearer(String clientId, String clientSecret, @Nullable String expectedSubject) {
 
         /**
          * Creates OAuth bearer details.

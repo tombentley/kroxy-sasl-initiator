@@ -20,6 +20,8 @@ import io.kroxylicious.proxy.filter.RequestFilterResult;
 import io.kroxylicious.proxy.filter.ResponseFilter;
 import io.kroxylicious.proxy.filter.ResponseFilterResult;
 
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
+
 /**
  * A no-op filter that forwards every request and every response unchanged.
  * <p>
@@ -29,6 +31,7 @@ import io.kroxylicious.proxy.filter.ResponseFilterResult;
 class SaslInitiationFilter implements RequestFilter, ResponseFilter {
 
     // Retained for the SASL state machine added by a later commit.
+    @SuppressFBWarnings(value = "URF_UNREAD_FIELD", justification = "Retained for the SASL state machine added by a later commit")
     private final SaslInitiationConfig config;
 
     SaslInitiationFilter(SaslInitiationConfig config) {
