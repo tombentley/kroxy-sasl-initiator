@@ -1,6 +1,6 @@
 # SASL Initiation Filter — Requirements and Design Decisions
 
-**Status:** Decisions locked; ready to be condensed into the final high-level plan.  
+**Status:** Decisions locked; review comments incorporated; ready to be condensed into the final high-level plan.  
 **Date:** 2026-11-24  
 **Baseline considered:** Kroxylicious `0.27.0-SNAPSHOT` (main at `fb1df74`), Kafka `4.3.2`, Java 21.
 
@@ -19,6 +19,8 @@ Kafka client  --->  [client-facing authentication filters]  --->  [SaslInitiatio
                           (TLS/mTLS, SaslTermination,               (proxy's own SASL
                            none)                                     client identity)
 ```
+
+`SaslInspection` is deliberately not shown as a client-facing authentication option: it is a passthrough observer, and initiation is incompatible with a client SASL passthrough in the same chain (the initiator would see the client's `SaslHandshake`/`SaslAuthenticate` frames and reject them). It can coexist only if some other filter terminates the client SASL before the initiator.
 
 The filter is **not**:
 
@@ -103,7 +105,7 @@ Broker credentials can be rotated independently of client credentials and withou
 
 ### UC6 — OAUTHBEARER upstream authentication
 
-The proxy obtains or supplies an OAuth bearer token and uses it to authenticate to the broker. This may be a shared service token, a shared client-credentials grant, or (if implemented) a per-subject token or client identity.
+The proxy obtains or supplies an OAuth bearer token and uses it to authenticate to the broker. This may be a shared service token, a shared client-credentials grant, or a per-subject OAuth client identity backed by client credentials in the KeyStore.
 
 ## 3. Requirements
 
@@ -126,7 +128,7 @@ The proxy obtains or supplies an OAuth bearer token and uses it to authenticate 
 **Credential storage**
 
 * R9. Store password-mechanism credentials (username + plaintext password) in a standard Java KeyStore.
-* R10. Support KeyStore location, store type, and store password from proxy configuration, using the existing `PasswordProvider` abstraction (`passwordFile` for production; inline password only for development).
+* R10. Support KeyStore location and store password from proxy configuration, using the existing `PasswordProvider` abstraction (`passwordFile` for production; inline password only for development). PKCS12 is the only supported store type.
 * R11. Never require or encourage broker passwords in plain text in the proxy YAML.
 * R12. Define a stable, versioned KeyStore entry format and tooling to create/update/list entries.
 * R13. Load credentials at filter initialization; define whether/when reload is supported.
@@ -135,9 +137,9 @@ The proxy obtains or supplies an OAuth bearer token and uses it to authenticate 
 **Protocol behaviour**
 
 * R15. Inject `SaslHandshake` and `SaslAuthenticate` at the correct point in the connection: after the optional client `ApiVersions`, and before the first business RPC.
-* R16. Determine SASL API versions from the broker's `ApiVersions` response, or the filter issues its own `ApiVersions` request if the first request from the client is not `ApiVersions`.
-* R17. Handle SASL challenge/response loops for SCRAM and OAUTHBEARER correctly, including the final server message. Ideally use the CallbackHandler APIs so that other mechanisms could be implemented easily. 
-* R18. Handle pipelining: the client may send requests before earlier responses arrive; no request may overtake the upstream authentication. The number of pipelined client request must be bounded ??? (How does the kafka broker handle this, and the risk of unbounded allocations for the pipeline. We should probably do the same thing).
+* R16. Determine SASL API versions from the client's `ApiVersions` response when it is available on the same route/connection; otherwise issue the filter's own `ApiVersions` request (v0, as Kafka's own `SaslClientAuthenticator` does). Never depend on the client having sent `ApiVersions`.
+* R17. Handle SASL challenge/response loops for SCRAM and OAUTHBEARER correctly, including the final server message. Use the Java SASL `CallbackHandler`/`AuthenticateCallbackHandler` APIs (`NameCallback`, `PasswordCallback`, `ScramExtensionsCallback`, `OAuthBearerTokenCallback`) so that other mechanisms can be added without changing the state machine.
+* R18. Handle pipelining: the client may send requests before earlier responses arrive; no request may overtake the upstream authentication. The filter must not add an unbounded request buffer. It relies on the runtime's existing deferred-stage backpressure (`FilterHandler` disables `autoRead` and pauses reads), which is the proxy equivalent of Kafka's per-connection channel mute after a request. The number of already-decoded frames is bounded by Netty's read batch/socket receive buffer and the filter's deferred-stage timeout; add a pipelining test to verify this, and revisit only if testing shows an unbounded allocation risk.
 * R19. Reject any downstream attempt to pass `SaslHandshake`/`SaslAuthenticate` through to the broker. Client-facing SASL must be terminated earlier in the chain.
 * R20. Handle broker authentication failure by returning a generic error for the triggering request and closing the connection, without exposing broker error details to the client.
 * R21. Support KIP-368 (SASL reauthentication) in the first release.
@@ -147,7 +149,7 @@ The proxy obtains or supplies an OAuth bearer token and uses it to authenticate 
 
 * R23. Work when placed after `SaslTermination` (the recommended order) and when the downstream client is anonymous or mTLS-authenticated.
 * R24. Document and, where possible, detect/validate the required filter-chain ordering.
-* R25. Ensure the filter's own generated SASL frames are not intercepted by other SASL filters closer to the broker. This normally means placing it last/closest to the broker. When used in conjunction with routing this filter needs to be on the last route's filter chain, rather than the virtual cluster filter chain.
+* R25. Ensure the filter's own generated SASL frames are not intercepted by other SASL filters closer to the broker. This normally means placing it last/closest to the broker. When used with routing, place it on each **leaf route's** filter chain, not the virtual-cluster filter chain, so it authenticates the route's actual upstream connection.
 
 **Observability and operations**
 
@@ -166,12 +168,11 @@ The proxy obtains or supplies an OAuth bearer token and uses it to authenticate 
 * S7. Apply KeyStore file permission checks (owner-only by default, with a documented Kubernetes/OpenShift relaxation).
 * S8. Avoid caching broker credentials or tokens in places that outlive the connection unless justified and bounded.
 * S9. Document the accepted risk that plaintext passwords/tokens exist in the JVM heap while in use.
-
-**TODO** do we need to guard against some kind of username enumeration attack? I don't think we do, at least while there is no coupling between the state machines for client- and broker-facing.
+* S10. Do not add a client-credential timing/enumeration defence in v1. The filter is not a client authentication endpoint: subject mode acts only on a subject established by a trusted downstream authenticator, and every upstream failure returns the same generic error and closes. A client that can probe arbitrary subjects has already bypassed or misconfigured the downstream authenticator. Revisit this if the termination/initiation state machines are coupled (so that a client SASL exchange can fail because of an upstream check) or if a downstream mechanism allows unauthenticated, attacker-chosen subjects.
 
 ### 3.3 Operational requirements
 
-* O1. Support PKCS12 (preferred) and, if cheap, JKS.
+* O1. Support PKCS12 (the only Java KeyStore type that can store the required `SecretKeyEntry` payload).
 * O2. Provide a CLI for creating and managing the KeyStore, because a versioned JSON payload inside a `SecretKeyEntry` is not practical with bare `keytool`.
 * O3. Support file-based store passwords for Kubernetes Secret/volume workflows.
 * O4. No hot reload in the first release unless explicitly chosen; credential rotation requires restart/reconfiguration.
@@ -193,7 +194,7 @@ The proxy obtains or supplies an OAuth bearer token and uses it to authenticate 
 * G3. Support both shared identity and per-subject identity selection.
 * G4. Store broker passwords in a standard Java KeyStore with a safe, documented format and tooling.
 * G5. Compose safely with `SaslTermination` and mTLS authentication.
-* G6. Implement correct Kafka SASL initiation, including API version negotiation, pipelining, and (if in scope) reauthentication.
+* G6. Implement correct Kafka SASL initiation, including API version handling, pipelining, and KIP-368 reauthentication.
 * G7. Fail closed, avoid secret leakage, and provide actionable observability.
 * G8. Be usable without changes to client applications.
 * G9. Follow existing Kroxylicious norms and patterns where possible.
@@ -206,7 +207,7 @@ The proxy obtains or supplies an OAuth bearer token and uses it to authenticate 
 * N4. Changing the downstream `Subject` or acting as an authorizer.
 * N5. Full OAuth token exchange/impersonation (RFC 8693, Confluent MDS impersonation) unless explicitly included later.
 * N6. Hot reload/rotation of KeyStore contents in the first release.
-* N7. Per-target-cluster credentials when routing to multiple upstream clusters, unless the routing API exposes the necessary target information and this is explicitly in scope.
+* N7. A single `SaslInitiation` instance spanning multiple target clusters. Routing deployments must configure the filter on each leaf route's filter chain, so each route authenticates its own upstream connection and can have its own credentials.
 * N8. Multiple mechanisms with fallback/negotiation within one filter instance.
 * N9. Raw SASL (SASL handshake v0) and pre-Kafka-4.0 client behaviour.
 * N10. Delegation tokens.
@@ -231,30 +232,44 @@ Rationale:
 
 There is currently no runtime API to validate chain order. The filter can defend itself by rejecting client-originated SASL frames, but cannot know whether a later filter will see its own upstream SASL frames. This must be documented and tested.
 
+#### Routing
+
+When the virtual cluster uses a router, `SaslInitiation` must be configured on the **leaf route's** filter chain, not on the virtual-cluster filter chain. This is already anticipated by the `RouterContext` API documentation: "SASL initiator" filters on per-route filter chains authenticate the proxy's outbound connection to the upstream cluster and do not affect the client subject.
+
+Reasons:
+
+* The route selects the target cluster. A virtual-cluster-level initiator would run before that selection and could send its internal `ApiVersions`/`SaslHandshake` to the wrong target (or to no target).
+* Per-route placement gives each leaf route its own filter instance and authentication state, so a client connection that fans out to multiple routes authenticates each upstream connection independently. Each route can also have its own filter definition and KeyStore, enabling per-target credentials.
+* The client subject remains available to a route filter through `FilterContext.authenticatedSubject()`; the initiator only reads it and never changes it.
+
+For a non-routing/direct deployment, the filter goes last on the virtual-cluster chain as shown above. The plan's tests must cover both placements.
+
 ### 6.2 Trigger point
 
 The filter has no connection-established callback in the current `Filter` API. It must trigger on a client request.
 
 Chosen rule:
 
-1. Forward the client's initial `ApiVersions` request/response normally. This is important for subject mode: with `SaslTermination`, the client must complete its `ApiVersions` + SASL exchange before a subject exists. Holding `ApiVersions` would deadlock.
+1. Forward the client's initial `ApiVersions` request/response normally, and cache the SASL API versions from the response for later use. This is important for subject mode: with `SaslTermination`, the client must complete its `ApiVersions` + SASL exchange before a subject exists. Holding `ApiVersions` would deadlock.
 2. On the first request that is **not** `ApiVersions` (and not a client SASL frame, which is rejected):
    * fixed mode: start upstream authentication immediately;
    * subject mode: resolve the subject; if eligible, start upstream authentication; otherwise fail closed.
-3. While authentication is in progress, return an incomplete `CompletionStage` for the triggering request. The runtime pauses reads and queues later requests, preserving order. This avoids a hand-written buffer and the associated ordering bugs.
-4. After successful authentication, forward the triggering request and all subsequent requests normally.
-5. If the first client request is not `ApiVersions` (non-standard client), authenticate before forwarding it.
+3. If the filter has not seen a usable client `ApiVersions` response (for example, because routing sent it to a different route, or the client omitted it), send the filter's own v0 `ApiVersions` request before the handshake.
+4. While authentication is in progress, return an incomplete `CompletionStage` for the triggering request. The runtime pauses reads and queues later requests, preserving order. This avoids a hand-written buffer and the associated ordering bugs.
+5. After successful authentication, forward the triggering request and all subsequent requests normally.
+6. If the first client request is not `ApiVersions` (non-standard client), authenticate before forwarding it.
 
 This rule avoids an extra delay on `ApiVersions` and avoids the deadlock between client SASL termination and subject selection.
 
-Alternative: initiate immediately after `ApiVersions` when the subject is already available (fixed mode or mTLS). This saves a small amount of latency but adds state complexity. It can be decided later.
+Not chosen for v1: initiating immediately after `ApiVersions` when the subject is already available. It saves a small amount of latency but adds state complexity and is harder to reason about with routing.
 
 ### 6.3 Upstream authentication sequence
 
 High-level sequence for one broker connection:
 
 ```text
-1. Send ApiVersionsRequest (internal, filter-originated).
+1. Use the cached client ApiVersions response if available; otherwise send the
+   filter's own ApiVersionsRequest (v0, matching Kafka's SaslClientAuthenticator).
 2. Choose SaslHandshake/SaslAuthenticate versions supported by the broker.
 3. Send SaslHandshakeRequest(mechanism).
 4. Create a SASL client for the mechanism with the selected credential.
@@ -265,6 +280,8 @@ High-level sequence for one broker connection:
 ```
 
 The internal requests are sent with `FilterContext.sendRequest`, which gives the filter the broker response asynchronously and preserves the connection's ordering/backpressure rules.
+
+SASL client construction uses the standard Java SASL APIs: `Sasl.createSaslClient(mechanism, ...)` with an `AuthenticateCallbackHandler`. Password mechanisms supply `NameCallback`, `PasswordCallback`, and `ScramExtensionsCallback`; OAUTHBEARER uses Kafka's OAuth callback handler / `OAuthBearerTokenCallback`. The challenge/response loop and the Kafka `SaslAuthenticate` framing are generic. Adding another mechanism should therefore require a new mechanism driver/callback-handler adapter, not a change to the filter state machine. A public mechanism SPI is not part of v1 (see D3); the internal driver boundary is designed to make one possible later.
 
 ### 6.4 Credential model
 
@@ -331,6 +348,7 @@ Field defaults and validation:
 * `oauthBearer.scope` and `oauthBearer.subjectClaimName` are optional. The default subject claim is `sub`.
 * `oauthBearer.jwtRetriever` is optional; the default is Kafka's `DefaultJwtRetriever`, which selects a retriever based on the endpoint URL.
 * `reauth.windowFactor` is optional, must be between 0.5 and 0.95, and defaults to 0.8. Randomized jitter is applied around this factor.
+* The filter-originated Kafka requests use the fixed client ID `kroxylicious-sasl-initiation`; it is not configurable.
 * No broker password or OAuth client secret is accepted directly in the YAML; those live in the KeyStore.
 
 ### 6.6 KeyStore entry format
@@ -422,13 +440,13 @@ All decisions below are locked as of 2026-11-24. The detailed sections preserve 
 | D13 | OAUTHBEARER source | Fixed token/client-credentials; per-subject client credentials; verify token subject; no impersonation | Decided |
 | D14 | Credential-store extensibility | Defer public SPI | Decided |
 | D15 | Trigger point | First non-`ApiVersions` request; no runtime hook | Decided |
-| D16 | API versions | Filter sends its own `ApiVersions` at trigger; broker 4.0+ | Decided |
+| D16 | API versions | Hybrid: cached client response when available, else own v0; broker 4.0+ | Decided |
 | D17 | Client SASL frames | Reject and close; SASL-specific error only because the client is SASL-aware | Decided |
-| D18 | Buffering | Runtime backpressure via incomplete stage | Decided |
+| D18 | Buffering | Runtime backpressure via incomplete stage; no filter-level queue | Decided |
 | D19 | Failure semantics | Generic error then close; no retry; no SASL-specific error for upstream failure | Decided |
 | D20 | Reauthentication | Proactive KIP-368 at 80% of effective lifetime; same identity; close on subject change | Decided |
 | D21 | Post-auth interception | Intercept all requests always | Decided |
-| D22 | Routing/multi-target | One target per client connection in v1 | Decided |
+| D22 | Routing/multi-target | Per-route leaf filter chain; per-target auth | Decided |
 | D23 | Token/credential caching | Shared bounded OAuth token cache | Decided |
 | D24 | Configuration schema | Nested groups + `PasswordProvider`; field names and validation locked in §6.5 | Decided |
 | D25 | Secret handling | No secret logging; pragmatic zeroization via a local destroyable wrapper | Decided |
@@ -453,7 +471,7 @@ The following were agreed on 2026-11-24:
 11. **Broker auth failure:** return a generic `UNKNOWN_SERVER_ERROR` for the triggering request, log sanitized details, and close; no retry.
 12. **Subject change:** if the downstream subject changes after upstream authentication, close the connection.
 13. **Post-auth interception:** intercept all requests, even after authentication. This simplifies subject-change detection and reauthentication pausing; the performance cost is accepted.
-14. **Routing scope:** one target cluster per client connection in v1; routing/multi-target is future work.
+14. **Routing scope:** place the filter on each leaf route's filter chain so each route authenticates its own upstream connection and can have its own credentials. A virtual-cluster-level placement is only for non-routing/direct deployments.
 15. **Broker versions:** Kafka 4.0+ brokers.
 16. **OAuth:** use Kafka's `FileJwtRetriever`/`ClientCredentialsJwtRetriever` per identity; for per-subject OAuth, verify the token's subject claim against the selected subject. No token exchange.
 17. **KeyStore sharing:** use a dedicated PKCS12 file for initiation credentials, separate from `SaslTermination`'s SCRAM credential store.
@@ -470,6 +488,11 @@ The following were agreed on 2026-11-24:
 28. **Termination/initiation coupling:** deliberately decoupled; accept slightly odd client-visible errors for SASL-terminated clients in exchange for uniform support of mTLS/anonymous clients. See §6.7.
 29. **Secret handling:** pragmatic zeroization using a local destroyable wrapper inspired by `DestroyableRawSecretKey`; no dependency on the KMS module.
 30. **Observability, testing, documentation:** metrics + structured logs; unit + protocol + real Kafka tests; full concept/config/security/ops docs.
+31. **API versions:** use the cached client `ApiVersions` response when available; otherwise send the filter's own v0 `ApiVersions` request.
+32. **Routing:** place `SaslInitiation` on each leaf route's filter chain so each route authenticates its own upstream connection and can have its own credentials.
+33. **Pipelining:** rely on the runtime's deferred-stage `autoRead(false)` backpressure; do not add a filter-level request queue. Kafka's broker mutes the channel after each request; the proxy's behaviour is analogous.
+34. **Username enumeration:** no v1-specific defence. The filter is not a client authentication endpoint; all upstream failures are generic; subject mode acts only on a trusted downstream subject. Revisit if termination/initiation are coupled or a downstream mechanism allows unauthenticated attacker-chosen subjects.
+35. **Internal client ID:** use a fixed constant for filter-originated requests; do not expose it in configuration.
 
 ### 7.3 Detailed decisions
 
@@ -556,6 +579,8 @@ The following were agreed on 2026-11-24:
 **Decision (2026-11-24):** Exactly one configured mechanism. The filter sends exactly one `SaslHandshakeRequest` naming that mechanism; the broker's handshake response is authoritative. If the broker rejects it with `UNSUPPORTED_SASL_MECHANISM`, the filter logs the broker's enabled mechanisms and fails the connection. It does **not** perform a second handshake with another mechanism.
 
 **Verification:** Kafka 4.3.2's `SaslClientAuthenticator.handleSaslHandshakeResponse` also treats a non-`NONE` handshake response as terminal. It throws `UnsupportedSaslMechanismException` containing the broker's enabled mechanisms; it does not retry. So "no retry" matches Kafka's own client behaviour. The broker's mechanism list is a diagnostic, not a negotiation opportunity.
+
+**Future mechanisms:** v1 implements PLAIN, SCRAM-SHA-256, SCRAM-SHA-512, and OAUTHBEARER. The SASL client/callback-handler boundary is intended to make additional (including nonstandard) mechanisms a localized implementation addition. A public mechanism SPI is not in v1.
 
 **Impact:** config schema, state machine, testing matrix.
 
@@ -754,10 +779,11 @@ See D3. If the answer is a public SPI, define:
 * A. Use the client's `ApiVersions` response (cache it). Saves a round trip, but depends on the request being forwarded to the same broker connection and not being modified.
 * B. Send the filter's own `ApiVersions` after the trigger. Deterministic, one extra round trip, works with routing/target selection.
 * C. Use fixed SASL versions (handshake v1, authenticate v2) without negotiation; fail if unsupported.
+* D. Hybrid: use the client's response when a usable one has been observed; otherwise send the filter's own v0 request.
 
-**Recommendation:** B. It is simpler to reason about and avoids coupling to the client's request routing. Use a version supported by the target broker; derive the `SaslHandshake`/`SaslAuthenticate` max versions from the response. Require handshake v1 (encapsulated SASL; the runtime already rejects v0). Define the minimum broker version in the plan.
+**Recommendation:** Use the client's cached `ApiVersions` response when it is available on the same route/connection; otherwise send the filter's own `ApiVersions` (v0) at trigger. This saves a round trip in the common Kafka-client case without depending on the client having sent `ApiVersions`.
 
-**Decision (2026-11-24):** The filter sends its own `ApiVersions` request at trigger time. Use API_VERSIONS v0 for this internal SASL bootstrap, matching Kafka 4.3.2's `SaslClientAuthenticator` ("Always use version 0 request since brokers treat requests with schema exceptions as GSSAPI tokens"). Derive the `SaslHandshake`/`SaslAuthenticate` versions from the response. Minimum supported broker is Kafka 4.0.
+**Decision (2026-11-24):** Hybrid. The filter caches the client's `ApiVersions` response (passing it through unchanged) and uses it to derive the `SaslHandshake`/`SaslAuthenticate` versions. If no usable cached response exists — for example the client omitted `ApiVersions`, or routing sent it to a different route — the filter sends its own API_VERSIONS v0 request, matching Kafka 4.3.2's `SaslClientAuthenticator` ("Always use version 0 request since brokers treat requests with schema exceptions as GSSAPI tokens"). Require handshake v1 (encapsulated SASL). Minimum supported broker is Kafka 4.0.
 
 **Impact:** compatibility, latency, routing behaviour, tests.
 
@@ -792,7 +818,9 @@ See D3. If the answer is a public SPI, define:
 
 **Recommendation:** A. It uses the documented filter contract, preserves ordering, and avoids duplicating runtime logic. The filter must still be defensive about unexpected requests during authentication (e.g. if the runtime delivers a queued request before the stage completes).
 
-**Decision (2026-11-24):** Rely on runtime backpressure via an incomplete `CompletionStage`; no hand-written request buffer.
+**Kafka comparison:** Kafka's broker does not accumulate a per-connection pipeline of requests. Its `Processor.processCompletedReceives` calls `selector.mute(connectionId)` after reading a request, and only unmutes the channel when the response is sent. Pipelined bytes therefore stay in the socket/TCP buffers. The broker's global request queue is bounded by `queued.max.requests` (default 500) and `queued.max.request.bytes` (default -1, i.e. no byte limit). Kroxylicious's `FilterHandler` has the equivalent per-connection behaviour: an incomplete filter stage calls `handleDeferredStage`, which sets `autoRead(false)` and pauses reads. The filter should not add another queue.
+
+**Decision (2026-11-24):** Rely on runtime backpressure via an incomplete `CompletionStage`; no hand-written request buffer. Add a test that pipelines many client requests during upstream authentication and verifies that the proxy remains bounded and processes or fails them deterministically. If that test exposes an unbounded already-decoded-frame queue, the fix belongs in the runtime's deferred-stage handling, not in this filter.
 
 **Impact:** implementation complexity, ordering, error handling, tests.
 
@@ -862,15 +890,15 @@ See D3. If the answer is a public SPI, define:
 
 **Options:**
 
-* A. v1 supports the standard one-target-cluster, one-server-connection-per-client-connection model. Routing/multi-target is out of scope or best-effort.
-* B. Support per-route/per-target authentication, requiring target-cluster information in the filter context/routing API.
+* A. v1 supports the standard one-target-cluster, one-server-connection-per-client-connection model, with the filter on the virtual-cluster chain. Routing/multi-target is out of scope or best-effort.
+* B. Place the filter on each leaf route's filter chain, so `sendRequest` is route-scoped; each route authenticates its own upstream connection and can have its own credentials.
 * C. Support only direct routing for v1.
 
-**Recommendation:** A/C. The current `FilterContext` exposes the virtual cluster but not a target-cluster identity, and the routing API is still evolving. Document the limitation and test the non-routing path. If routing is required, define how `sendRequest` selects the target and how per-target state is keyed before committing.
+**Recommendation:** B via per-route filter placement. The runtime already supports per-route filter chains (`RouteDescriptor.filters`, `RouteFilterHandler`) and the `RouterContext` API explicitly anticipates SASL initiator filters on per-route chains. Placing the filter on the leaf route means `sendRequest` is route-scoped and targets the correct upstream cluster. Each route gets its own filter instance/state and can have its own credentials.
 
-**Decision (2026-11-24):** Support one target cluster per client connection in v1; routing/multi-target is future work.
+**Decision (2026-11-24):** Support routing by requiring `SaslInitiation` to be configured on each leaf route's filter chain. A virtual-cluster-level placement is only for non-routing/direct deployments. This provides per-target authentication without needing target-cluster information in `FilterContext`. The client subject is still read from the shared connection context and is never modified by the initiator.
 
-**Impact:** routing support, config, API dependencies, tests.
+**Impact:** routing support, per-route config, tests. This supersedes the earlier "one target per client connection" limitation.
 
 ---
 
@@ -984,10 +1012,11 @@ See D3. If the answer is a public SPI, define:
 3. **Identity-change security.** If a downstream client reauthenticates as a different user on an existing connection, the subject-mode initiator detects the changed subject on the next request and closes. This is a security-critical behaviour and must be tested, including during an in-flight proactive reauthentication.
 4. **OAUTHBEARER identity semantics.** A client-credentials token identifies the OAuth client, not necessarily the downstream user. True per-user impersonation requires token exchange, which is a materially larger feature. The v1 design verifies the token subject against the KeyStore's expected subject, but the mapping remains deployment-defined.
 5. **KeyStore plaintext risk.** The KeyStore protects passwords at rest, but the proxy must hold them in plaintext in memory to perform SASL. The threat model must state this explicitly. The local destroyable-secret wrapper reduces avoidable copies but cannot eliminate JVM/Kafka-internal copies.
-6. **Routing/multi-target ambiguity.** If a client connection can reach multiple target clusters, per-target credentials and per-target SASL state are not addressed by the current API. Do not claim support without testing.
-7. **Kafka API version compatibility.** SASL handshake v0/raw SASL is rejected by Kroxylicious; the filter requires handshake v1 and derives the handshake/authenticate versions from the broker's `ApiVersions` response. The internal bootstrap uses API_VERSIONS v0, matching Kafka's own client.
+6. **Routing placement.** Under routing, the filter must be on each leaf route's filter chain. A virtual-cluster-level initiator runs before target selection and can authenticate the wrong upstream (or none). This must be documented and covered by a routing integration test; the runtime does not currently validate it.
+7. **Kafka API version compatibility.** SASL handshake v0/raw SASL is rejected by Kroxylicious; the filter requires handshake v1. It uses the cached client `ApiVersions` response when available, otherwise its own API_VERSIONS v0 request, matching Kafka's own client.
 8. **Secret leakage via errors.** Kafka broker error messages can contain details. Forward only generic errors; log sanitized details.
 9. **Client-visible error semantics.** When the downstream client used `SaslTermination`, it may have already seen a successful SASL exchange before an upstream initiation failure is discovered. The client then receives a generic error/disconnect on a later request. Coupling the termination and initiation state machines would improve this, but would harm mTLS/anonymous support and composability; see §6.7.
+10. **Pipelined frames during authentication.** The filter relies on the runtime's deferred-stage `autoRead(false)` backpressure, analogous to Kafka's per-connection channel mute. Already-decoded frames are bounded by Netty's read batch/socket buffer and the deferred-stage timeout, but this must be verified with a pipelining test. Do not add a filter-level request queue.
 
 ## 9. Next steps
 
@@ -1007,10 +1036,10 @@ All the key decisions in this document are now recorded as decided, with the rat
 * **JKS KeyStore format.** Rejected because JKS cannot store `SecretKeyEntry` objects (`KeyStoreException: Cannot store non-PrivateKeys`); the versioned JSON-in-a-secret-key design requires PKCS12.
 * **Per-subject static OAuth tokens in the KeyStore.** Deferred. Per-subject OAuth uses client credentials and Kafka's `ClientCredentialsJwtRetriever`; token exchange/impersonation is future work.
 * **Reusing the downstream client's OAUTHBEARER token.** Rejected because `ClientSaslContext` does not expose the token and it would couple initiation to a specific client mechanism.
-* **Using the client's `ApiVersions` response to learn SASL versions.** Rejected in favour of the filter sending its own v0 `ApiVersions` request, which is deterministic and matches Kafka's `SaslClientAuthenticator`.
+* **Always sending the filter's own `ApiVersions` request.** Rejected as the only strategy because it adds an unnecessary round trip in the common case where the client's `ApiVersions` response is already available. The chosen design uses the cached client response when possible and falls back to its own v0 request.
 * **Lazy or absent reauthentication.** Rejected in favour of proactive, jittered KIP-368 reauthentication for production readiness.
 * **Hot reloading KeyStore contents.** Deferred; credentials are loaded once at initialization.
-* **Per-target-cluster credentials under routing.** Deferred; v1 supports one target per client connection.
+* **A single virtual-cluster-level initiator under routing.** Rejected because the target cluster is not selected yet. Routing deployments place the filter on each leaf route chain; this also gives per-target credentials.
 
 ## 11. References
 
