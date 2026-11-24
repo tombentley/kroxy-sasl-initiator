@@ -17,7 +17,7 @@ The filter therefore sits on the **upstream** side of the proxy:
 ```text
 Kafka client  --->  [client-facing authentication filters]  --->  [SaslInitiation]  --->  Kafka broker
                           (TLS/mTLS, SaslTermination,               (proxy's own SASL
-                           SaslInspection, none)                     client identity)
+                           none)                                     client identity)
 ```
 
 The filter is **not**:
@@ -111,7 +111,7 @@ The proxy obtains or supplies an OAuth bearer token and uses it to authenticate 
 
 **Mechanisms**
 
-* R1. Support `PLAIN`, `SCRAM-SHA-256`, `SCRAM-SHA-512`, and `OAUTHBEARER`.
+* R1. Support `PLAIN`, `SCRAM-SHA-256`, `SCRAM-SHA-512`, and `OAUTHBEARER`, with the possibility of other (perhaps nonstandard) mechanisms being added in the future.
 * R2. Use the IANA-registered mechanism names in configuration and on the wire.
 * R3. Prefer delegation to Kafka/JDK SASL client implementations over reimplementing mechanisms. This mirrors `SaslTermination`'s use of Kafka's `SaslServer`.
 
@@ -135,19 +135,19 @@ The proxy obtains or supplies an OAuth bearer token and uses it to authenticate 
 **Protocol behaviour**
 
 * R15. Inject `SaslHandshake` and `SaslAuthenticate` at the correct point in the connection: after the optional client `ApiVersions`, and before the first business RPC.
-* R16. Determine SASL API versions from the broker's `ApiVersions` response, or use a defined safe compatibility strategy.
-* R17. Handle SASL challenge/response loops for SCRAM and OAUTHBEARER correctly, including the final server message.
-* R18. Handle pipelining: the client may send requests before earlier responses arrive; no request may overtake the upstream authentication.
+* R16. Determine SASL API versions from the broker's `ApiVersions` response, or the filter issues its own `ApiVersions` request if the first request from the client is not `ApiVersions`.
+* R17. Handle SASL challenge/response loops for SCRAM and OAUTHBEARER correctly, including the final server message. Ideally use the CallbackHandler APIs so that other mechanisms could be implemented easily. 
+* R18. Handle pipelining: the client may send requests before earlier responses arrive; no request may overtake the upstream authentication. The number of pipelined client request must be bounded ??? (How does the kafka broker handle this, and the risk of unbounded allocations for the pipeline. We should probably do the same thing).
 * R19. Reject any downstream attempt to pass `SaslHandshake`/`SaslAuthenticate` through to the broker. Client-facing SASL must be terminated earlier in the chain.
 * R20. Handle broker authentication failure by returning a generic error for the triggering request and closing the connection, without exposing broker error details to the client.
-* R21. Support KIP-368 (SASL reauthentication) or explicitly declare it out of scope for the first release.
+* R21. Support KIP-368 (SASL reauthentication) in the first release.
 * R22. Preserve the downstream client's `Subject`; this filter must not call `clientSaslAuthenticationSuccess`/`clientSaslAuthenticationFailure` to impersonate a client authentication outcome.
 
 **Composition**
 
 * R23. Work when placed after `SaslTermination` (the recommended order) and when the downstream client is anonymous or mTLS-authenticated.
 * R24. Document and, where possible, detect/validate the required filter-chain ordering.
-* R25. Ensure the filter's own generated SASL frames are not intercepted by other SASL filters closer to the broker. This normally means placing it last/closest to the broker.
+* R25. Ensure the filter's own generated SASL frames are not intercepted by other SASL filters closer to the broker. This normally means placing it last/closest to the broker. When used in conjunction with routing this filter needs to be on the last route's filter chain, rather than the virtual cluster filter chain.
 
 **Observability and operations**
 
@@ -166,6 +166,8 @@ The proxy obtains or supplies an OAuth bearer token and uses it to authenticate 
 * S7. Apply KeyStore file permission checks (owner-only by default, with a documented Kubernetes/OpenShift relaxation).
 * S8. Avoid caching broker credentials or tokens in places that outlive the connection unless justified and bounded.
 * S9. Document the accepted risk that plaintext passwords/tokens exist in the JVM heap while in use.
+
+**TODO** do we need to guard against some kind of username enumeration attack? I don't think we do, at least while there is no coupling between the state machines for client- and broker-facing.
 
 ### 3.3 Operational requirements
 
@@ -194,6 +196,7 @@ The proxy obtains or supplies an OAuth bearer token and uses it to authenticate 
 * G6. Implement correct Kafka SASL initiation, including API version negotiation, pipelining, and (if in scope) reauthentication.
 * G7. Fail closed, avoid secret leakage, and provide actionable observability.
 * G8. Be usable without changes to client applications.
+* G9. Follow existing Kroxylicious norms and patterns where possible.
 
 ## 5. Non-goals
 
@@ -217,7 +220,7 @@ The proxy obtains or supplies an OAuth bearer token and uses it to authenticate 
 Recommended chain order, client-to-broker:
 
 ```text
-... -> SaslTermination (optional) -> SaslInitiation (last) -> broker
+... -> SaslTermination (optional) -> ... -> SaslInitiation (last) -> broker
 ```
 
 Rationale:
@@ -313,8 +316,6 @@ filterDefinitions:
 
       reauth:
         windowFactor: 0.8      # optional; default 0.8
-
-      clientId: kroxylicious-sasl-initiation   # optional
 ```
 
 Field defaults and validation:
@@ -330,7 +331,6 @@ Field defaults and validation:
 * `oauthBearer.scope` and `oauthBearer.subjectClaimName` are optional. The default subject claim is `sub`.
 * `oauthBearer.jwtRetriever` is optional; the default is Kafka's `DefaultJwtRetriever`, which selects a retriever based on the endpoint URL.
 * `reauth.windowFactor` is optional, must be between 0.5 and 0.95, and defaults to 0.8. Randomized jitter is applied around this factor.
-* `clientId` is optional and defaults to `kroxylicious-sasl-initiation`.
 * No broker password or OAuth client secret is accepted directly in the YAML; those live in the KeyStore.
 
 ### 6.6 KeyStore entry format
