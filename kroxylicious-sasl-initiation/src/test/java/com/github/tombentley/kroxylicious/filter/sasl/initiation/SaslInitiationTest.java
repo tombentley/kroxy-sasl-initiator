@@ -6,33 +6,56 @@
 
 package com.github.tombentley.kroxylicious.filter.sasl.initiation;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.attribute.PosixFileAttributeView;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.time.Duration;
 import java.util.List;
+import java.util.Map;
 import java.util.ServiceLoader;
 
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
+import com.github.tombentley.kroxylicious.filter.sasl.initiation.config.IdentityConfig;
+import com.github.tombentley.kroxylicious.filter.sasl.initiation.config.IdentityMode;
+import com.github.tombentley.kroxylicious.filter.sasl.initiation.config.KeyStoreConfig;
+import com.github.tombentley.kroxylicious.filter.sasl.initiation.config.Mechanism;
+import com.github.tombentley.kroxylicious.filter.sasl.initiation.config.ReauthConfig;
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.config.SaslInitiationConfig;
+import com.github.tombentley.kroxylicious.filter.sasl.initiation.credentials.KeyStorePermissions;
+import com.github.tombentley.kroxylicious.filter.sasl.initiation.credentials.SubjectAlias;
+import com.github.tombentley.kroxylicious.filter.sasl.initiation.identity.FixedIdentitySelector;
+import com.github.tombentley.kroxylicious.filter.sasl.initiation.identity.SubjectIdentitySelector;
 
 import io.kroxylicious.kafka.common.message.ApiVersionsRequestData;
 import io.kroxylicious.kafka.common.message.ApiVersionsResponseData;
 import io.kroxylicious.kafka.common.message.RequestHeaderData;
 import io.kroxylicious.kafka.common.message.ResponseHeaderData;
 import io.kroxylicious.kafka.common.protocol.ApiKeys;
+import io.kroxylicious.proxy.config.secret.InlinePassword;
 import io.kroxylicious.proxy.filter.Filter;
 import io.kroxylicious.proxy.filter.FilterFactory;
 import io.kroxylicious.proxy.filter.FilterFactoryContext;
+import io.kroxylicious.proxy.plugin.PluginConfigurationException;
 import io.kroxylicious.testing.filter.assertj.MockFilterContextAssert;
 import io.kroxylicious.testing.filter.context.MockFilterContext;
 
+import static com.github.tombentley.kroxylicious.filter.sasl.initiation.TestStores.BROKER_PASSWORD;
+import static com.github.tombentley.kroxylicious.filter.sasl.initiation.TestStores.STORE_PASSWORD;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.mock;
 
 class SaslInitiationTest {
 
+    @TempDir
+    Path tempDir;
+
     private final SaslInitiation factory = new SaslInitiation();
-    private final SaslInitiationConfig config = new SaslInitiationConfig("PLAIN");
+    private final FilterFactoryContext context = mock(FilterFactoryContext.class);
 
     @Test
     void shouldBeDiscoverableByServiceLoader() {
@@ -45,37 +68,140 @@ class SaslInitiationTest {
     }
 
     @Test
-    void shouldRejectNullOrBlankMechanism() {
-        assertThatThrownBy(() -> new SaslInitiationConfig(null))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("mechanism");
-        assertThatThrownBy(() -> new SaslInitiationConfig(""))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("mechanism");
-        assertThatThrownBy(() -> new SaslInitiationConfig("   "))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("mechanism");
+    void initializesFixedIdentityWithRealStore() throws Exception {
+        Path storeFile = tempDir.resolve("credentials.p12");
+        TestStores.writePasswordStore(storeFile, "alice", "bob");
+        SaslInitiationConfig config = config(Mechanism.SCRAM_SHA_256, IdentityMode.FIXED, "alice", storeFile, 0.8);
+
+        SaslInitiationRuntimeConfig runtime = factory.initialize(context, config);
+        try {
+            assertThat(runtime.config()).isSameAs(config);
+            assertThat(runtime.identitySelector()).isInstanceOf(FixedIdentitySelector.class);
+            assertThat(((FixedIdentitySelector) runtime.identitySelector()).key()).isEqualTo("alice");
+            assertThat(runtime.credentialStore().size()).isEqualTo(2);
+            assertThat(runtime.credentialStore().find("alice")).isPresent();
+
+            Filter filter = factory.createFilter(context, runtime);
+            assertThat(filter).isInstanceOf(SaslInitiationFilter.class);
+        }
+        finally {
+            factory.close(runtime);
+        }
+
+        assertThat(runtime.credentialStore().credentials().get("alice").toString())
+                .doesNotContain(BROKER_PASSWORD);
     }
 
     @Test
-    void shouldInitializeAndCreateFilter() {
-        FilterFactoryContext context = mock(FilterFactoryContext.class);
+    void initializesSubjectIdentityWithRealStore() throws Exception {
+        Path storeFile = tempDir.resolve("credentials.p12");
+        TestStores.writePasswordStore(storeFile, "alice");
+        SaslInitiationConfig config = config(Mechanism.PLAIN, IdentityMode.SUBJECT, null, storeFile, 0.9);
 
-        SaslInitiationConfig initialized = factory.initialize(context, config);
-        Filter filter = factory.createFilter(context, initialized);
+        SaslInitiationRuntimeConfig runtime = factory.initialize(context, config);
+        try {
+            assertThat(runtime.identitySelector()).isInstanceOf(SubjectIdentitySelector.class);
+            assertThat(((SubjectIdentitySelector) runtime.identitySelector()).principalType())
+                    .isEqualTo(IdentityConfig.resolvePrincipalType(IdentityConfig.DEFAULT_PRINCIPAL_TYPE));
+            assertThat(runtime.config().reauth().windowFactor()).isEqualTo(0.9);
+        }
+        finally {
+            factory.close(runtime);
+        }
+    }
 
-        assertThat(initialized).isSameAs(config);
-        assertThat(filter).isInstanceOf(SaslInitiationFilter.class);
+    @Test
+    void failsInitializationWhenStoreFileIsMissing() {
+        SaslInitiationConfig config = config(Mechanism.PLAIN, IdentityMode.FIXED, "alice",
+                tempDir.resolve("missing.p12"), 0.8);
+
+        assertThatThrownBy(() -> factory.initialize(context, config))
+                .isInstanceOf(PluginConfigurationException.class)
+                .hasMessageContaining("not found")
+                .satisfies(e -> assertThat(e.getMessage()).doesNotContain(STORE_PASSWORD));
+    }
+
+    @Test
+    void failsInitializationWhenFixedKeyIsMissing() throws Exception {
+        Path storeFile = tempDir.resolve("credentials.p12");
+        TestStores.writePasswordStore(storeFile, "bob");
+        SaslInitiationConfig config = config(Mechanism.SCRAM_SHA_256, IdentityMode.FIXED, "alice", storeFile, 0.8);
+
+        assertThatThrownBy(() -> factory.initialize(context, config))
+                .isInstanceOf(PluginConfigurationException.class)
+                .hasMessageContaining("No PASSWORD credential")
+                .hasMessageContaining("alice");
+    }
+
+    @Test
+    void failsInitializationWhenStoreContainsWrongEntryType() throws Exception {
+        Path storeFile = tempDir.resolve("credentials.p12");
+        String oauthJson = """
+                {"version":1,"subject":"alice","oauthBearer":{"clientId":"alice-client","clientSecret":"client-secret"}}
+                """;
+        TestStores.writeRawStore(storeFile,
+                Map.of(SubjectAlias.hash("alice"), oauthJson.getBytes(java.nio.charset.StandardCharsets.UTF_8)),
+                STORE_PASSWORD);
+        SaslInitiationConfig config = config(Mechanism.PLAIN, IdentityMode.FIXED, "alice", storeFile, 0.8);
+
+        assertThatThrownBy(() -> factory.initialize(context, config))
+                .isInstanceOf(PluginConfigurationException.class)
+                .hasMessageContaining("OAUTH")
+                .hasMessageContaining("PASSWORD");
+    }
+
+    @Test
+    void failsInitializationWhenStoreEntryIsMalformed() throws Exception {
+        Path storeFile = tempDir.resolve("credentials.p12");
+        TestStores.writeRawStore(storeFile,
+                Map.of(SubjectAlias.hash("alice"), "not-json".getBytes(java.nio.charset.StandardCharsets.UTF_8)),
+                STORE_PASSWORD);
+        SaslInitiationConfig config = config(Mechanism.PLAIN, IdentityMode.FIXED, "alice", storeFile, 0.8);
+
+        assertThatThrownBy(() -> factory.initialize(context, config))
+                .isInstanceOf(PluginConfigurationException.class)
+                .hasMessageContaining("Invalid credential entry");
+    }
+
+    @Test
+    void failsInitializationWhenStoreEntryAliasDoesNotMatchSubject() throws Exception {
+        Path storeFile = tempDir.resolve("credentials.p12");
+        TestStores.writeRawStore(storeFile,
+                Map.of(SubjectAlias.hash("bob"), TestStores.rawJson("alice", "broker-alice", BROKER_PASSWORD)),
+                STORE_PASSWORD);
+        SaslInitiationConfig config = config(Mechanism.PLAIN, IdentityMode.FIXED, "alice", storeFile, 0.8);
+
+        assertThatThrownBy(() -> factory.initialize(context, config))
+                .isInstanceOf(PluginConfigurationException.class)
+                .hasMessageContaining("does not match the SHA-256 hash");
+    }
+
+    @Test
+    void failsInitializationWhenStorePermissionsAreInsecure() throws Exception {
+        Assumptions.assumeFalse("true".equalsIgnoreCase(System.getenv(KeyStorePermissions.ALLOW_INSECURE_PERMISSIONS_ENV_VAR)),
+                "Permission checks are explicitly disabled by the environment");
+        Assumptions.assumeTrue(Files.getFileAttributeView(tempDir, PosixFileAttributeView.class) != null,
+                "POSIX permissions are not available");
+
+        Path storeFile = tempDir.resolve("credentials.p12");
+        TestStores.writePasswordStore(storeFile, "alice");
+        Files.setPosixFilePermissions(storeFile, PosixFilePermissions.fromString("rw-r--r--"));
+        SaslInitiationConfig config = config(Mechanism.PLAIN, IdentityMode.FIXED, "alice", storeFile, 0.8);
+
+        assertThatThrownBy(() -> factory.initialize(context, config))
+                .isInstanceOf(PluginConfigurationException.class)
+                .hasMessageContaining("insecure permissions")
+                .hasMessageContaining(KeyStorePermissions.ALLOW_INSECURE_PERMISSIONS_ENV_VAR);
     }
 
     @Test
     void shouldForwardRequestUnchanged() {
         RequestHeaderData header = new RequestHeaderData();
         ApiVersionsRequestData request = new ApiVersionsRequestData();
-        MockFilterContext context = MockFilterContext.builder(header, request).build();
-        SaslInitiationFilter filter = new SaslInitiationFilter(config);
+        MockFilterContext filterContext = MockFilterContext.builder(header, request).build();
+        SaslInitiationFilter filter = new SaslInitiationFilter(passThroughConfig());
 
-        assertThat(filter.onRequest(ApiKeys.API_VERSIONS, (short) 0, header, request, context))
+        assertThat(filter.onRequest(ApiKeys.API_VERSIONS, (short) 0, header, request, filterContext))
                 .succeedsWithin(Duration.ZERO)
                 .satisfies(result -> MockFilterContextAssert.assertThat(result)
                         .isForwardRequest()
@@ -87,14 +213,33 @@ class SaslInitiationTest {
     void shouldForwardResponseUnchanged() {
         ResponseHeaderData header = new ResponseHeaderData();
         ApiVersionsResponseData response = new ApiVersionsResponseData();
-        MockFilterContext context = MockFilterContext.builder(header, response).build();
-        SaslInitiationFilter filter = new SaslInitiationFilter(config);
+        MockFilterContext filterContext = MockFilterContext.builder(header, response).build();
+        SaslInitiationFilter filter = new SaslInitiationFilter(passThroughConfig());
 
-        assertThat(filter.onResponse(ApiKeys.API_VERSIONS, (short) 0, header, response, context))
+        assertThat(filter.onResponse(ApiKeys.API_VERSIONS, (short) 0, header, response, filterContext))
                 .succeedsWithin(Duration.ZERO)
                 .satisfies(result -> MockFilterContextAssert.assertThat(result)
                         .isForwardResponse()
                         .hasHeaderEqualTo(header)
                         .hasMessageEqualTo(response));
+    }
+
+    private static SaslInitiationConfig config(Mechanism mechanism,
+                                               IdentityMode mode,
+                                               String key,
+                                               Path storeFile,
+                                               double windowFactor) {
+        return new SaslInitiationConfig(
+                mechanism,
+                new IdentityConfig(mode, key),
+                new KeyStoreConfig(storeFile.toString(), TestStores.passwordProvider(STORE_PASSWORD)),
+                new ReauthConfig(windowFactor));
+    }
+
+    private static SaslInitiationConfig passThroughConfig() {
+        return new SaslInitiationConfig(
+                Mechanism.PLAIN,
+                new IdentityConfig(IdentityMode.FIXED, "alice"),
+                new KeyStoreConfig("/not/read/by/the/pass-through/filter.p12", new InlinePassword("not-used")));
     }
 }
