@@ -68,10 +68,8 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
     private final IdentitySelector identitySelector;
     private final MechanismDriver mechanismDriver;
 
-    private SaslExchangeState state = SaslExchangeState.AWAITING_TRIGGER;
+    private SaslExchangeState state = new SaslExchangeState.AwaitingTrigger();
     private @Nullable SaslApiVersions cachedApiVersions;
-    private @Nullable CompletionStage<Boolean> authenticationStage;
-    private long sessionLifetimeMs;
 
     /**
      * Creates a per-connection filter.
@@ -109,23 +107,18 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
         }
 
         return switch (state) {
-            case AWAITING_TRIGGER -> {
+            case SaslExchangeState.AwaitingTrigger ignored -> {
                 if (apiKey == ApiKeys.API_VERSIONS) {
                     yield context.forwardRequest(header, request);
                 }
                 yield startAuthentication(context, header, request);
             }
-            case AUTHENTICATING -> {
-                CompletionStage<Boolean> stage = authenticationStage;
-                if (stage == null) {
-                    yield failureResult(context, header, request);
-                }
-                yield stage.thenCompose(success -> success
-                        ? context.forwardRequest(header, request)
-                        : failureResult(context, header, request));
-            }
-            case AUTHENTICATED -> context.forwardRequest(header, request);
-            case FAILED -> failureResult(context, header, request);
+            case SaslExchangeState.Authenticating authenticating -> authenticating.stage()
+                    .thenCompose(result -> result.authenticated()
+                            ? context.forwardRequest(header, request)
+                            : failureResult(context, header, request));
+            case SaslExchangeState.Authenticated ignored -> context.forwardRequest(header, request);
+            case SaslExchangeState.Failed ignored -> failureResult(context, header, request);
         };
     }
 
@@ -134,7 +127,7 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
                                                                        ResponseHeaderData header,
                                                                        ApiVersionsResponseData response,
                                                                        FilterContext context) {
-        if (state == SaslExchangeState.AWAITING_TRIGGER) {
+        if (state instanceof SaslExchangeState.AwaitingTrigger) {
             Optional<SaslApiVersions> versions = SaslApiVersions.from(response);
             versions.ifPresent(value -> cachedApiVersions = value);
         }
@@ -150,15 +143,6 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
         return state;
     }
 
-    /**
-     * Returns the broker-reported session lifetime from the last successful authentication response.
-     *
-     * @return the session lifetime in milliseconds, or zero if the broker did not report one
-     */
-    long sessionLifetimeMs() {
-        return sessionLifetimeMs;
-    }
-
     private CompletionStage<RequestFilterResult> rejectClientSaslFrame(FilterContext context,
                                                                        RequestHeaderData header,
                                                                        ApiMessage request,
@@ -166,7 +150,7 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
         LOGGER.atWarn()
                 .addKeyValue("errorCode", error.code())
                 .log("Rejecting client-originated SASL frame; client SASL must be terminated before SaslInitiation");
-        state = SaslExchangeState.FAILED;
+        state = new SaslExchangeState.Failed();
         return context.requestFilterResultBuilder()
                 .errorResponse(header, request, error)
                 .withCloseConnection()
@@ -176,26 +160,43 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
     private CompletionStage<RequestFilterResult> startAuthentication(FilterContext context,
                                                                      RequestHeaderData header,
                                                                      ApiMessage request) {
-        state = SaslExchangeState.AUTHENTICATING;
-        final CompletionStage<Boolean> stage;
+        final CompletionStage<SaslExchangeState.AuthenticationResult> exchange;
         try {
-            stage = authenticate(context);
+            exchange = authenticate(context);
         }
         catch (RuntimeException e) {
             LOGGER.atWarn()
                     .addKeyValue("mechanism", config.mechanism())
                     .addKeyValue("errorType", e.getClass().getSimpleName())
                     .log("SASL initiation failed before starting the exchange");
-            state = SaslExchangeState.FAILED;
+            state = new SaslExchangeState.Failed();
             return failureResult(context, header, request);
         }
-        authenticationStage = stage;
-        return stage.thenCompose(success -> success
+
+        CompletableFuture<SaslExchangeState.AuthenticationResult> stage = new CompletableFuture<>();
+        SaslExchangeState.Authenticating authenticating = new SaslExchangeState.Authenticating(stage);
+        state = authenticating;
+        exchange.whenComplete((result, error) -> {
+            if (error != null) {
+                logExchangeFailure(error);
+            }
+            SaslExchangeState.AuthenticationResult outcome = error == null && result != null
+                    ? result
+                    : SaslExchangeState.AuthenticationResult.failure();
+            if (state == authenticating) {
+                state = outcome.authenticated()
+                        ? new SaslExchangeState.Authenticated(outcome.sessionLifetimeMs())
+                        : new SaslExchangeState.Failed();
+            }
+            stage.complete(outcome);
+        });
+
+        return stage.thenCompose(result -> result.authenticated()
                 ? context.forwardRequest(header, request)
                 : failureResult(context, header, request));
     }
 
-    private CompletionStage<Boolean> authenticate(FilterContext context) {
+    private CompletionStage<SaslExchangeState.AuthenticationResult> authenticate(FilterContext context) {
         final PasswordCredential credential;
         try {
             IdentitySnapshot identity = identitySelector.select(context);
@@ -210,23 +211,20 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
                     .addKeyValue("mechanism", config.mechanism())
                     .addKeyValue("errorType", e.getClass().getSimpleName())
                     .log("SASL initiation could not select a usable broker credential");
-            state = SaslExchangeState.FAILED;
-            return CompletableFuture.completedFuture(false);
+            return CompletableFuture.completedFuture(SaslExchangeState.AuthenticationResult.failure());
         }
 
-        CompletionStage<Boolean> stage = resolveApiVersions(context)
+        CompletionStage<Long> exchange = resolveApiVersions(context)
                 .thenCompose(versions -> sendHandshake(context, versions))
-                .thenCompose(versions -> performExchange(context, credential, versions).thenApply(ignored -> true));
+                .thenCompose(versions -> performExchange(context, credential, versions));
 
-        return stage.handle((success, error) -> {
-            boolean authenticated = error == null && Boolean.TRUE.equals(success);
-            if (!authenticated && error != null) {
+        return exchange.handle((sessionLifetimeMs, error) -> {
+            if (error != null) {
                 logExchangeFailure(error);
+                return SaslExchangeState.AuthenticationResult.failure();
             }
-            if (state == SaslExchangeState.AUTHENTICATING) {
-                state = authenticated ? SaslExchangeState.AUTHENTICATED : SaslExchangeState.FAILED;
-            }
-            return authenticated;
+            return SaslExchangeState.AuthenticationResult.success(
+                    Objects.requireNonNull(sessionLifetimeMs, "sessionLifetimeMs"));
         });
     }
 
@@ -274,7 +272,7 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
                 });
     }
 
-    private CompletionStage<Void> performExchange(FilterContext context,
+    private CompletionStage<Long> performExchange(FilterContext context,
                                                   PasswordCredential storedCredential,
                                                   SaslApiVersions versions) {
         PasswordCredential exchangeCredential = new PasswordCredential(
@@ -290,7 +288,7 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
             return CompletableFuture.failedFuture(new SaslExchangeException("Could not create the SASL client", e));
         }
 
-        CompletionStage<Void> exchange;
+        CompletionStage<Long> exchange;
         try {
             byte[] initialToken = client.hasInitialResponse()
                     ? client.evaluateChallenge(EMPTY_BYTES)
@@ -304,7 +302,7 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
         return exchange.whenComplete((ignored, error) -> closeExchange(client, callbackHandler, exchangeCredential));
     }
 
-    private CompletionStage<Void> sendAuthenticate(FilterContext context,
+    private CompletionStage<Long> sendAuthenticate(FilterContext context,
                                                    SaslClient client,
                                                    SaslApiVersions versions,
                                                    byte[] token) {
@@ -322,14 +320,14 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
                         return CompletableFuture.failedFuture(new SaslExchangeException(
                                 "The broker rejected SASL authentication", error.code()));
                     }
-                    sessionLifetimeMs = response.sessionLifetimeMs();
+                    long sessionLifetimeMs = response.sessionLifetimeMs();
                     byte[] serverToken = response.authBytes() == null ? EMPTY_BYTES : response.authBytes();
                     if (client.isComplete()) {
                         if (serverToken.length > 0) {
                             return CompletableFuture.failedFuture(new SaslExchangeException(
                                     "The broker sent unexpected SASL data after authentication completed"));
                         }
-                        return CompletableFuture.completedFuture(null);
+                        return CompletableFuture.completedFuture(sessionLifetimeMs);
                     }
                     final byte[] nextToken;
                     try {
@@ -341,7 +339,7 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
                     }
                     if (nextToken == null && client.isComplete()) {
                         // SCRAM consumes the broker's final server message and must not send another token.
-                        return CompletableFuture.completedFuture(null);
+                        return CompletableFuture.completedFuture(sessionLifetimeMs);
                     }
                     return sendAuthenticate(context, client, versions, nextToken == null ? EMPTY_BYTES : nextToken);
                 });

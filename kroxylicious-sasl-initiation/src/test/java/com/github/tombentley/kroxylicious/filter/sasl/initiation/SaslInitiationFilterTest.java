@@ -62,7 +62,7 @@ class SaslInitiationFilterTest {
     void authenticatesOnFirstBusinessRequestAfterClientApiVersions() {
         FakeSaslBroker broker = new FakeSaslBroker().withSessionLifetimeMs(5000);
         SaslInitiationFilter filter = filter(Mechanism.PLAIN);
-        assertThat(filter.state()).isEqualTo(SaslExchangeState.AWAITING_TRIGGER);
+        assertThat(filter.state()).isInstanceOf(SaslExchangeState.AwaitingTrigger.class);
 
         RequestHeaderData apiVersionsHeader = header(ApiKeys.API_VERSIONS);
         ApiVersionsRequestData apiVersionsRequest = new ApiVersionsRequestData();
@@ -73,7 +73,7 @@ class SaslInitiationFilterTest {
                         .isForwardRequest()
                         .hasHeaderEqualTo(apiVersionsHeader)
                         .hasMessageEqualTo(apiVersionsRequest));
-        assertThat(filter.state()).isEqualTo(SaslExchangeState.AWAITING_TRIGGER);
+        assertThat(filter.state()).isInstanceOf(SaslExchangeState.AwaitingTrigger.class);
 
         ResponseHeaderData responseHeader = new ResponseHeaderData();
         ApiVersionsResponseData response = FakeSaslBroker.apiVersionsResponse();
@@ -84,7 +84,7 @@ class SaslInitiationFilterTest {
                         .isForwardResponse()
                         .hasHeaderEqualTo(responseHeader)
                         .hasMessageEqualTo(response));
-        assertThat(filter.state()).isEqualTo(SaslExchangeState.AWAITING_TRIGGER);
+        assertThat(filter.state()).isInstanceOf(SaslExchangeState.AwaitingTrigger.class);
 
         RequestHeaderData businessHeader = header(ApiKeys.METADATA);
         MetadataRequestData businessRequest = new MetadataRequestData();
@@ -96,8 +96,9 @@ class SaslInitiationFilterTest {
                         .hasHeaderEqualTo(businessHeader)
                         .hasMessageEqualTo(businessRequest));
 
-        assertThat(filter.state()).isEqualTo(SaslExchangeState.AUTHENTICATED);
-        assertThat(filter.sessionLifetimeMs()).isEqualTo(5000);
+        assertThat(filter.state())
+                .isInstanceOfSatisfying(SaslExchangeState.Authenticated.class,
+                        authenticated -> assertThat(authenticated.sessionLifetimeMs()).isEqualTo(5000));
         assertThat(broker.capturedRequests())
                 .extracting(captured -> captured.request().apiKey())
                 .containsExactly(ApiKeys.SASL_HANDSHAKE.id, ApiKeys.SASL_AUTHENTICATE.id);
@@ -124,7 +125,7 @@ class SaslInitiationFilterTest {
         assertThat(requests.get(0).header().clientId()).isEqualTo(RequestHeaderFactory.CLIENT_ID);
         assertThat(requests.get(1).request()).isInstanceOf(SaslHandshakeRequestData.class);
         assertThat(requests.get(2).request()).isInstanceOf(SaslAuthenticateRequestData.class);
-        assertThat(filter.state()).isEqualTo(SaslExchangeState.AUTHENTICATED);
+        assertThat(filter.state()).isInstanceOf(SaslExchangeState.Authenticated.class);
     }
 
     @Test
@@ -228,7 +229,7 @@ class SaslInitiationFilterTest {
                         .errorResponse()
                         .hasError(expectedError));
 
-        assertThat(filter.state()).isEqualTo(SaslExchangeState.FAILED);
+        assertThat(filter.state()).isInstanceOf(SaslExchangeState.Failed.class);
     }
 
     @Test
@@ -242,7 +243,7 @@ class SaslInitiationFilterTest {
         CompletionStage<RequestFilterResult> first = filter.onRequest(ApiKeys.METADATA, (short) 0, firstHeader, firstRequest,
                 firstContext);
         assertThat(first.toCompletableFuture().isDone()).isFalse();
-        assertThat(filter.state()).isEqualTo(SaslExchangeState.AUTHENTICATING);
+        assertThat(filter.state()).isInstanceOf(SaslExchangeState.Authenticating.class);
 
         RequestHeaderData secondHeader = header(ApiKeys.METADATA);
         MetadataRequestData secondRequest = new MetadataRequestData();
@@ -262,7 +263,7 @@ class SaslInitiationFilterTest {
                 .satisfies(result -> MockFilterContextAssert.assertThat(result)
                         .isForwardRequest()
                         .hasMessageEqualTo(secondRequest));
-        assertThat(filter.state()).isEqualTo(SaslExchangeState.AUTHENTICATED);
+        assertThat(filter.state()).isInstanceOf(SaslExchangeState.Authenticated.class);
     }
 
     @Test
@@ -291,7 +292,7 @@ class SaslInitiationFilterTest {
                         .errorResponse()
                         .hasError(Errors.UNKNOWN_SERVER_ERROR));
 
-        assertThat(filter.state()).isEqualTo(SaslExchangeState.FAILED);
+        assertThat(filter.state()).isInstanceOf(SaslExchangeState.Failed.class);
     }
 
     private void assertAuthenticationFailure(SaslInitiationFilter filter, FakeSaslBroker broker) {
@@ -307,7 +308,7 @@ class SaslInitiationFilterTest {
                         .errorResponse()
                         .hasError(Errors.UNKNOWN_SERVER_ERROR));
 
-        assertThat(filter.state()).isEqualTo(SaslExchangeState.FAILED);
+        assertThat(filter.state()).isInstanceOf(SaslExchangeState.Failed.class);
         assertThat(context.clientSaslGestureInvocations()).isEmpty();
     }
 

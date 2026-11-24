@@ -72,8 +72,9 @@ class SaslScramInitiationFilterTest {
                         .hasHeaderEqualTo(header)
                         .hasMessageEqualTo(request));
 
-        assertThat(filter.state()).isEqualTo(SaslExchangeState.AUTHENTICATED);
-        assertThat(filter.sessionLifetimeMs()).isEqualTo(5000);
+        assertThat(filter.state())
+                .isInstanceOfSatisfying(SaslExchangeState.Authenticated.class,
+                        authenticated -> assertThat(authenticated.sessionLifetimeMs()).isEqualTo(5000));
         List<FakeSaslBroker.CapturedRequest> requests = broker.capturedRequests();
         assertThat(requests)
                 .extracting(captured -> captured.request().apiKey())
@@ -148,7 +149,7 @@ class SaslScramInitiationFilterTest {
                         .errorResponse()
                         .hasError(Errors.UNKNOWN_SERVER_ERROR));
 
-        assertThat(filter.state()).isEqualTo(SaslExchangeState.FAILED);
+        assertThat(filter.state()).isInstanceOf(SaslExchangeState.Failed.class);
         assertThat(context.clientSaslGestureInvocations()).isEmpty();
     }
 
