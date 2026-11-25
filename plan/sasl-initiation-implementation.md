@@ -1922,6 +1922,23 @@ with the example config; the full test matrix is green.
 * Kubernetes Operator/Secret templating integration and a Strimzi-based system test.
 * Performance benchmarks for post-auth interception and reauth storms.
 
+### 8.4 Documentation reconciliation
+
+Writing the first-release documentation (Commit 15) exposed the following differences between the plan text and the
+implemented behaviour. The documentation follows the implementation; the plan entries are retained as the historical
+design intent.
+
+1. **`identity.key` in fixed-identity OAUTHBEARER with a token file.** §8.1 item 4 says the key is optional in this mode
+   and suggests an internal key `fixed`. The implementation requires a non-blank `identity.key` in every fixed mode,
+   including a fixed `file:` token, and uses the configured key as the identity lookup/cache key. The configuration
+   reference documents the key as required.
+2. **`keyStore` in fixed-identity OAUTHBEARER with a token file.** §6.5 describes the KeyStore as optional in this mode.
+   The implementation rejects a configured `keyStore` because there is no KeyStore entry to use: the token file is
+   trusted and not subject-mapped. The configuration reference documents the KeyStore as forbidden (must be omitted).
+3. **Token-retrieval metric tags.** D26 recommends token-retrieval duration/outcome alongside the main authentication
+   metrics but does not fix tags. The implementation records `kroxylicious_filter_sasl_initiation_token_retrieval_duration_seconds`
+   with only the bounded `outcome` tag; the documentation states this explicitly.
+
 ---
 
 ## 9. Appendix — Test matrix and example configuration

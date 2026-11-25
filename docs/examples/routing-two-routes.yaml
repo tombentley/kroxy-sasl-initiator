@@ -1,0 +1,78 @@
+#
+# Copyright Kroxylicious Authors.
+#
+# Licensed under the Apache Software License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
+#
+
+# Routing: one SaslInitiation instance per leaf route, each with its own target
+# cluster and credential store. Do not put SaslInitiation on the virtual-cluster
+# filter chain when the target is a router.
+filterDefinitions:
+  - name: sasl-initiation-route-a
+    type: SaslInitiation
+    config:
+      mechanism: SCRAM-SHA-256
+      identity:
+        mode: fixed
+        key: route-a-service
+      keyStore:
+        file: /etc/kroxylicious/route-a.p12
+        filePassword:
+          passwordFile: /etc/kroxylicious/route-a.p12.password
+
+  - name: sasl-initiation-route-b
+    type: SaslInitiation
+    config:
+      mechanism: SCRAM-SHA-256
+      identity:
+        mode: fixed
+        key: route-b-service
+      keyStore:
+        file: /etc/kroxylicious/route-b.p12
+        filePassword:
+          passwordFile: /etc/kroxylicious/route-b.p12.password
+
+clusterDefinitions:
+  - name: cluster-a
+    bootstrapServers: kafka-a.example.com:9093
+    tls:
+      trust:
+        storeFile: /etc/kroxylicious/kafka-a.truststore.p12
+        storePassword:
+          passwordFile: /etc/kroxylicious/kafka-a.truststore.password
+  - name: cluster-b
+    bootstrapServers: kafka-b.example.com:9093
+    tls:
+      trust:
+        storeFile: /etc/kroxylicious/kafka-b.truststore.p12
+        storePassword:
+          passwordFile: /etc/kroxylicious/kafka-b.truststore.password
+
+routerDefinitions:
+  - name: leaf-router
+    # Replace with the router plugin type used by your deployment.
+    type: com.example.router.FanOutRouter
+    config: {}
+    routes:
+      - name: route-a
+        id: 0
+        filters:
+          - sasl-initiation-route-a
+        target:
+          cluster: cluster-a
+      - name: route-b
+        id: 1
+        filters:
+          - sasl-initiation-route-b
+        target:
+          cluster: cluster-b
+
+virtualClusters:
+  - name: demo
+    target:
+      router: leaf-router
+    # Client-facing filters may be configured here. SaslInitiation must not be.
+    gateways:
+      - name: default
+        portIdentifiesNode:
+          bootstrapAddress: localhost:9192

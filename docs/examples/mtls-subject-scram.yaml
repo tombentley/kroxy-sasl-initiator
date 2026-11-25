@@ -1,0 +1,57 @@
+#
+# Copyright Kroxylicious Authors.
+#
+# Licensed under the Apache Software License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
+#
+
+# mTLS client mapped to a downstream User principal, then to a per-user
+# SCRAM-SHA-512 broker credential. The broker sees the mapped broker username.
+filterDefinitions:
+  - name: sasl-initiation
+    type: SaslInitiation
+    config:
+      mechanism: SCRAM-SHA-512
+      identity:
+        mode: subject
+        principalType: io.kroxylicious.proxy.authentication.User
+      keyStore:
+        file: /etc/kroxylicious/sasl-initiation.p12
+        filePassword:
+          passwordFile: /etc/kroxylicious/sasl-initiation.p12.password
+
+clusterDefinitions:
+  - name: kafka
+    bootstrapServers: kafka.example.com:9093
+    tls:
+      trust:
+        storeFile: /etc/kroxylicious/kafka.truststore.p12
+        storePassword:
+          passwordFile: /etc/kroxylicious/kafka.truststore.password
+
+virtualClusters:
+  - name: demo
+    target:
+      cluster: kafka
+    filters:
+      - sasl-initiation
+    subjectBuilder:
+      type: DefaultTransportSubjectBuilderService
+      config:
+        addPrincipals:
+          - from: clientTlsSanDnsName
+            principalFactory: io.kroxylicious.proxy.authentication.UserFactory
+    gateways:
+      - name: default
+        portIdentifiesNode:
+          bootstrapAddress: localhost:9192
+        tls:
+          key:
+            storeFile: /etc/kroxylicious/proxy-server.p12
+            storePassword:
+              passwordFile: /etc/kroxylicious/proxy-server.p12.password
+          trust:
+            storeFile: /etc/kroxylicious/client-ca.p12
+            storePassword:
+              passwordFile: /etc/kroxylicious/client-ca.p12.password
+            trustOptions:
+              clientAuth: REQUIRED

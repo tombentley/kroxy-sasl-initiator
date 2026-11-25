@@ -3,27 +3,188 @@
 A standalone [Kroxylicious](https://kroxylicious.io) filter plugin that authenticates the proxy to an
 upstream Apache Kafka broker using SASL.
 
-The project currently implements PKCS12 credential storage, the credential-management CLI, fixed and subject-derived
-identity selection, and PLAIN/SCRAM-SHA-256/SCRAM-SHA-512 initiation against a real Kafka broker. OAUTHBEARER and
-KIP-368 reauthentication arrive in later commits.
+The first release supports `PLAIN`, `SCRAM-SHA-256`, `SCRAM-SHA-512` and `OAUTHBEARER`, fixed and
+subject-derived identities, a PKCS12 credential store with a management CLI, KIP-368
+reauthentication, bounded metrics and structured logs. It targets Kroxylicious `0.26.0`, Kafka
+clients `4.3.2`, Kafka brokers `4.0+` and Java 21.
+
+## Documentation
+
+* [Concepts: what SASL initiation is and where it sits](docs/concepts.md)
+* [Configuration reference](docs/configuration.md)
+* [KeyStore and CLI operations, permissions and rotation](docs/operations.md)
+* [Deployment, chain order, mTLS and routing](docs/deployment.md)
+* [Security](docs/security.md)
+* [Failure semantics and observability](docs/observability.md)
+* [Migration from the test-only `SaslPlainInitiation`](docs/migration.md)
+* [Example YAML files](docs/examples/)
 
 ## Requirements
 
 - Java 21
-- Maven 3.9 or later
+- Maven 3.9 or later to build from source
+- A Kroxylicious 0.26.0 runtime
+- Kafka 4.0 or later brokers
 
 ## Modules
 
 | Module | Purpose |
 | --- | --- |
-| `kroxylicious-sasl-initiation-credentials` | PKCS12 credential store, credential model and secret handling (future commits). |
+| `kroxylicious-sasl-initiation-credentials` | PKCS12 credential store, credential model, secret handling and file permissions. |
 | `kroxylicious-sasl-initiation` | The `SaslInitiation` filter plugin and its configuration. |
-| `kroxylicious-sasl-initiation-credential-tool` | Command line tooling for managing initiation credentials (future commits). |
-| `kroxylicious-sasl-initiation-integration-tests` | Integration tests that run against a real Kafka broker. |
+| `kroxylicious-sasl-initiation-credential-tool` | CLI for creating and maintaining initiation credentials. |
+| `kroxylicious-sasl-initiation-integration-tests` | Integration tests against real Kafka brokers. |
 
-The parent project is `kroxylicious-sasl-initiation-parent` (`com.github.tombentley.kroxylicious.sasl:0.1.0-SNAPSHOT`). The filter
-targets Kroxylicious `0.26.0` and Kafka clients `4.3.2`. The Kroxylicious parent POM is deliberately not used, so
-the build is self-contained.
+The parent project is `kroxylicious-sasl-initiation-parent`
+(`com.github.tombentley.kroxylicious.sasl:0.1.0-SNAPSHOT`). The Kroxylicious parent POM is
+deliberately not used, so the build is self-contained.
+
+## Quick start
+
+### 1. Get the CLI
+
+A release distribution provides a `sasl-initiation-credential-tool` launcher. From a source checkout,
+build the modules and define a helper:
+
+```shell
+mvn -q -DskipTests -DskipITs install
+mvn -q -pl kroxylicious-sasl-initiation-credential-tool \
+  dependency:build-classpath -Dmdep.outputFile=target/cli-classpath.txt
+
+sasl-initiation-credential-tool() {
+  java -cp "kroxylicious-sasl-initiation-credential-tool/target/kroxylicious-sasl-initiation-credential-tool-0.1.0-SNAPSHOT-all.jar:$(cat kroxylicious-sasl-initiation-credential-tool/target/cli-classpath.txt)" \
+    com.github.tombentley.kroxylicious.filter.sasl.initiation.cli.SaslInitiationCredentialTool "$@"
+}
+```
+
+The CLI needs the Kroxylicious, Jackson and SLF4J runtime jars; the distribution launcher already
+supplies them. See [KeyStore and CLI operations](docs/operations.md) for the full option reference.
+
+### 2. Create the credential store
+
+```shell
+printf '%s\n' "$STORE_PASSWORD" > /etc/kroxylicious/sasl-initiation.p12.password
+chmod 600 /etc/kroxylicious/sasl-initiation.p12.password
+
+sasl-initiation-credential-tool create \
+  --file /etc/kroxylicious/sasl-initiation.p12 \
+  --store-password-file /etc/kroxylicious/sasl-initiation.p12.password
+
+printf '%s\n' "$BROKER_PASSWORD" > /etc/kroxylicious/broker-password
+chmod 600 /etc/kroxylicious/broker-password
+
+sasl-initiation-credential-tool add-password \
+  --file /etc/kroxylicious/sasl-initiation.p12 \
+  --subject proxy-service \
+  --username svc-proxy \
+  --store-password-file /etc/kroxylicious/sasl-initiation.p12.password \
+  --password-file /etc/kroxylicious/broker-password
+```
+
+Never put broker passwords in the Kroxylicious YAML.
+
+### 3. Configure the filter
+
+```yaml
+filterDefinitions:
+  - name: sasl-initiation
+    type: SaslInitiation
+    config:
+      mechanism: SCRAM-SHA-256
+      identity:
+        mode: fixed
+        key: proxy-service
+      keyStore:
+        file: /etc/kroxylicious/sasl-initiation.p12
+        filePassword:
+          passwordFile: /etc/kroxylicious/sasl-initiation.p12.password
+```
+
+Put the filter last on the virtual cluster's chain, closest to the broker:
+
+```yaml
+virtualClusters:
+  - name: demo
+    target:
+      cluster: kafka
+    filters:
+      - sasl-initiation
+    gateways:
+      - name: default
+        portIdentifiesNode:
+          bootstrapAddress: localhost:9192
+```
+
+Use TLS on the upstream cluster, especially with `PLAIN`. See the
+[configuration reference](docs/configuration.md) and the
+[examples](docs/examples/).
+
+### 4. Operate it
+
+* Rotate credentials by updating the KeyStore and restarting the proxy. There is no hot reload.
+* Keep the store and password file owner-only (`0600`). Kubernetes/OpenShift Secret volumes may need
+  the documented permission escape hatch.
+* Watch `kroxylicious_filter_sasl_initiation_auth_attempts_total`,
+  `..._reauth_attempts_total`, and `..._connection_closed_total` for failures.
+
+## Composition and chain order
+
+Client-facing authentication must happen before SASL initiation, from the client towards the broker:
+
+```text
+client -> ... -> SaslTermination (optional) -> ... -> SaslInitiation (last) -> broker
+```
+
+* `SaslTermination` must see and terminate the client's `SaslHandshake`/`SaslAuthenticate` frames.
+* `SaslInitiation` must be last, so its own upstream SASL frames are not intercepted by another SASL
+  filter.
+* An anonymous or mTLS-authenticated client can go directly to `SaslInitiation`; no client SASL
+  termination is required.
+* If client SASL frames reach `SaslInitiation`, the filter rejects them with
+  `UNSUPPORTED_SASL_MECHANISM` (handshake) or `ILLEGAL_SASL_STATE` (authenticate) and closes the
+  connection. This is a misconfiguration, not a supported passthrough mode.
+* `SaslInspection` passthrough is incompatible. It can coexist only if another filter terminates
+  client SASL before the initiator.
+
+Use a separate credential store for initiation credentials and for any client-facing SCRAM
+credential store.
+
+### Routing
+
+When the virtual cluster uses a router, configure `SaslInitiation` on each **leaf route's** filter
+chain, not on the virtual-cluster filter chain. Each leaf route then authenticates its own upstream
+connection and can use its own mechanism and credential store:
+
+```yaml
+routerDefinitions:
+  - name: leaf-router
+    type: com.example.router.FanOutRouter
+    config: {}
+    routes:
+      - name: route-a
+        id: 0
+        filters: [sasl-initiation-route-a]
+        target:
+          cluster: cluster-a
+      - name: route-b
+        id: 1
+        filters: [sasl-initiation-route-b]
+        target:
+          cluster: cluster-b
+
+virtualClusters:
+  - name: demo
+    target:
+      router: leaf-router
+    # Client-facing filters may go here, but not SaslInitiation.
+    filters: [sasl-termination]
+```
+
+A virtual-cluster-level initiator is **not** a supported routing placement. It runs before the
+router selects a target, so it cannot authenticate every leaf route and its internal SASL frames can
+go to the wrong upstream (or to no target). The runtime does not currently reject this
+configuration. Routes that resolve to the same upstream address can share a connection and therefore
+cannot have independent per-route credentials.
 
 ## Building
 
@@ -31,8 +192,8 @@ the build is self-contained.
 mvn verify
 ```
 
-This compiles all modules, runs unit tests (`*Test` via Surefire), runs integration tests (`*IT` via Failsafe), and
-checks formatting, import order, license headers and Checkstyle rules.
+This compiles all modules, runs unit tests (`*Test` via Surefire), runs integration tests (`*IT` via
+Failsafe), and checks formatting, import order, license headers and Checkstyle rules.
 
 Static analysis is opt-in because it is slower:
 
@@ -40,8 +201,8 @@ Static analysis is opt-in because it is slower:
 mvn -Pspotbugs verify
 ```
 
-The `spotbugs` profile runs SpotBugs at maximum effort with the low threshold and fails the build on any finding in
-production classes. CI runs this profile as well.
+The `spotbugs` profile runs SpotBugs at maximum effort with the low threshold and fails the build on
+any finding in production classes. CI runs this profile as well.
 
 Formatting and license checks are validation-only by default. To apply the fixes locally:
 
@@ -64,118 +225,9 @@ mvn -pl kroxylicious-sasl-initiation-integration-tests -am verify
 ```
 
 The integration tests use the in-VM Kafka broker from
-[`kroxylicious-testing`](https://github.com/kroxylicious/kroxylicious-junit5-extension), so Docker is not required for
-the plaintext smoke test. Pass `-DskipITs=true` to skip integration tests, or `-DskipUTs=true` to skip unit tests.
-
-## Using the filter
-
-The plugin is registered through `META-INF/services/io.kroxylicious.proxy.filter.FilterFactory`. A minimal filter
-definition looks like this:
-
-```yaml
-filterDefinitions:
-  - name: sasl-initiation
-    type: SaslInitiation
-    config:
-      mechanism: SCRAM-SHA-256
-      identity:
-        mode: fixed
-        key: proxy-service
-      keyStore:
-        file: /etc/kroxylicious/sasl-initiation.p12
-        filePassword:
-          passwordFile: /etc/kroxylicious/sasl-initiation.p12.password
-```
-
-Create the PKCS12 store with `sasl-initiation-credential-tool`; do not put broker passwords directly in the proxy YAML.
-
-## Composition and chain order
-
-Client-facing authentication must happen before SASL initiation, from the client towards the broker:
-
-```text
-client -> ... -> SaslTermination (optional) -> ... -> SaslInitiation (last) -> broker
-```
-
-* `SaslTermination` must see and terminate the client's `SaslHandshake`/`SaslAuthenticate` frames.
-* `SaslInitiation` must be last, so its own upstream SASL frames are not intercepted by another SASL filter.
-* An anonymous or mTLS-authenticated client can go directly to `SaslInitiation`; no client SASL termination is required.
-* If client SASL frames reach `SaslInitiation` (no termination filter, or `SaslInitiation` placed before
-  `SaslTermination`), the filter rejects the handshake with `UNSUPPORTED_SASL_MECHANISM` and closes the connection.
-  This is a misconfiguration, not a supported passthrough mode.
-
-Use a separate credential store for initiation credentials and for any client-facing SCRAM credential store. The
-integration-test composition matrix covers this separation, mapped identities, mechanism translation, mTLS, anonymous
-clients, and the unsafe configurations above.
-
-### Routing
-
-When the virtual cluster uses a router, configure `SaslInitiation` on each **leaf route's** filter chain, not on the
-virtual-cluster filter chain. Each leaf route then authenticates its own upstream connection and can use its own
-credential store:
-
-```yaml
-filterDefinitions:
-  - name: sasl-initiation-route-a
-    type: SaslInitiation
-    config:
-      mechanism: SCRAM-SHA-256
-      identity:
-        mode: fixed
-        key: route-a-service
-      keyStore:
-        file: /etc/kroxylicious/route-a.p12
-        filePassword:
-          passwordFile: /etc/kroxylicious/route-a.p12.password
-
-  - name: sasl-initiation-route-b
-    type: SaslInitiation
-    config:
-      mechanism: SCRAM-SHA-256
-      identity:
-        mode: fixed
-        key: route-b-service
-      keyStore:
-        file: /etc/kroxylicious/route-b.p12
-        filePassword:
-          passwordFile: /etc/kroxylicious/route-b.p12.password
-
-routerDefinitions:
-  - name: leaf-router
-    type: <router plugin type>
-    config: {}
-    routes:
-      - name: route-a
-        id: 0
-        filters: [sasl-initiation-route-a]
-        target:
-          cluster: cluster-a
-      - name: route-b
-        id: 1
-        filters: [sasl-initiation-route-b]
-        target:
-          cluster: cluster-b
-
-virtualClusters:
-  - name: demo
-    target:
-      router: leaf-router
-    # Client-facing authentication may go here, but not SaslInitiation.
-    filters: [sasl-termination]
-    gateways:
-      - name: default
-        portIdentifiesNode:
-          bootstrapAddress: localhost:9192
-```
-
-A virtual-cluster-level initiator is **not** a supported routing placement. It runs before the router selects a target,
-so it cannot authenticate every leaf route and its internal SASL frames can go to the wrong upstream (or to no target).
-The runtime does not currently reject this configuration. Use one leaf route per upstream connection; routes that
-resolve to the same upstream address can share a connection and therefore cannot have independent per-route
-credentials.
-
-Kroxylicious 0.26.0 `SaslTermination` supports SCRAM and OAUTHBEARER, but not PLAIN. A client-facing PLAIN terminator is
-therefore not tested; the composition tests use SCRAM client termination.
+[`kroxylicious-testing`](https://github.com/kroxylicious/kroxylicious-junit5-extension), so Docker is
+not required for the plaintext smoke test. Pass `-DskipITs=true` to skip integration tests, or
+`-DskipUTs=true` to skip unit tests.
 
 ## License
 
