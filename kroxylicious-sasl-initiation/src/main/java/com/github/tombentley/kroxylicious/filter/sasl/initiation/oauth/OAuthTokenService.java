@@ -7,6 +7,7 @@
 package com.github.tombentley.kroxylicious.filter.sasl.initiation.oauth;
 
 import java.time.Clock;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -35,6 +36,7 @@ import com.github.tombentley.kroxylicious.filter.sasl.initiation.config.Identity
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.config.OAuthBearerConfig;
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.credentials.KeyStoreCredentialStore;
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.credentials.OAuthClientCredential;
+import com.github.tombentley.kroxylicious.filter.sasl.initiation.metrics.SaslInitiationMetrics;
 
 import edu.umd.cs.findbugs.annotations.Nullable;
 
@@ -120,46 +122,54 @@ public final class OAuthTokenService implements AutoCloseable {
     }
 
     private OAuthBearerToken loadToken(String lookupKey, @Nullable OAuthClientCredential credential) {
-        JwtComponents component = components.computeIfAbsent(lookupKey,
-                key -> componentsFactory.create(key, credential));
-        if (closed) {
-            components.remove(lookupKey, component);
-            component.close();
-            throw new OAuthTokenException("The OAuth token service is closed");
-        }
-        String serializedToken;
+        long startedNanos = System.nanoTime();
+        boolean success = false;
         try {
-            serializedToken = component.retriever().retrieve();
-        }
-        catch (RuntimeException e) {
-            LOGGER.atWarn()
-                    .addKeyValue("stage", "retrieval")
-                    .addKeyValue("errorType", e.getClass().getSimpleName())
-                    .log("OAuth token retrieval failed");
-            throw new OAuthTokenException("OAuth token retrieval failed");
-        }
+            JwtComponents component = components.computeIfAbsent(lookupKey,
+                    key -> componentsFactory.create(key, credential));
+            if (closed) {
+                components.remove(lookupKey, component);
+                component.close();
+                throw new OAuthTokenException("The OAuth token service is closed");
+            }
+            String serializedToken;
+            try {
+                serializedToken = component.retriever().retrieve();
+            }
+            catch (RuntimeException e) {
+                LOGGER.atWarn()
+                        .addKeyValue("stage", "retrieval")
+                        .addKeyValue("errorType", e.getClass().getSimpleName())
+                        .log("OAuth token retrieval failed");
+                throw new OAuthTokenException("OAuth token retrieval failed");
+            }
 
-        final OAuthBearerToken token;
-        try {
-            token = component.validator().validate(serializedToken);
+            final OAuthBearerToken token;
+            try {
+                token = component.validator().validate(serializedToken);
+            }
+            catch (RuntimeException e) {
+                LOGGER.atWarn()
+                        .addKeyValue("stage", "validation")
+                        .addKeyValue("errorType", e.getClass().getSimpleName())
+                        .log("OAuth token validation failed");
+                throw new OAuthTokenException("OAuth token validation failed");
+            }
+            if (token == null) {
+                throw new OAuthTokenException("OAuth token validation returned no token");
+            }
+            if (credential != null && !credential.expectedSubject().equals(token.principalName())) {
+                LOGGER.atWarn()
+                        .addKeyValue("stage", "subject")
+                        .log("The retrieved OAuth token subject does not match the expected subject");
+                throw new OAuthTokenException("The retrieved OAuth token subject does not match the expected subject");
+            }
+            success = true;
+            return new RedactedOAuthBearerToken(token);
         }
-        catch (RuntimeException e) {
-            LOGGER.atWarn()
-                    .addKeyValue("stage", "validation")
-                    .addKeyValue("errorType", e.getClass().getSimpleName())
-                    .log("OAuth token validation failed");
-            throw new OAuthTokenException("OAuth token validation failed");
+        finally {
+            SaslInitiationMetrics.recordTokenRetrieval(success, Duration.ofNanos(System.nanoTime() - startedNanos));
         }
-        if (token == null) {
-            throw new OAuthTokenException("OAuth token validation returned no token");
-        }
-        if (credential != null && !credential.expectedSubject().equals(token.principalName())) {
-            LOGGER.atWarn()
-                    .addKeyValue("stage", "subject")
-                    .log("The retrieved OAuth token subject does not match the expected subject");
-            throw new OAuthTokenException("The retrieved OAuth token subject does not match the expected subject");
-        }
-        return new RedactedOAuthBearerToken(token);
     }
 
     /**

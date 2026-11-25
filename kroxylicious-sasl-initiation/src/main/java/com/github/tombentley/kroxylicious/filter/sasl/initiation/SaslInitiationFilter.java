@@ -7,9 +7,11 @@
 package com.github.tombentley.kroxylicious.filter.sasl.initiation;
 
 import java.time.Clock;
+import java.time.Duration;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
 
 import javax.security.sasl.SaslClient;
@@ -18,6 +20,8 @@ import javax.security.sasl.SaslException;
 import org.apache.kafka.common.security.oauthbearer.OAuthBearerToken;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.event.Level;
+import org.slf4j.spi.LoggingEventBuilder;
 
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.config.IdentityMode;
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.config.Mechanism;
@@ -29,6 +33,8 @@ import com.github.tombentley.kroxylicious.filter.sasl.initiation.credentials.Pas
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.identity.IdentityGuard;
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.identity.IdentitySelector;
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.identity.IdentitySnapshot;
+import com.github.tombentley.kroxylicious.filter.sasl.initiation.metrics.LogSanitizer;
+import com.github.tombentley.kroxylicious.filter.sasl.initiation.metrics.SaslInitiationMetrics;
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.oauth.OAuthTokenService;
 
 import io.kroxylicious.kafka.common.message.ApiVersionsRequestData;
@@ -74,6 +80,22 @@ final class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFi
 
     private static final Logger LOGGER = LoggerFactory.getLogger(SaslInitiationFilter.class);
     private static final byte[] EMPTY_BYTES = new byte[0];
+
+    private static final String LOG_KEY_SESSION_ID = "sessionId";
+    private static final String LOG_KEY_VIRTUAL_CLUSTER = "virtualCluster";
+    private static final String LOG_KEY_MECHANISM = "mechanism";
+    private static final String LOG_KEY_OUTCOME = "outcome";
+    private static final String LOG_KEY_BROKER_USERNAME = "brokerUsername";
+    private static final String LOG_KEY_SUBJECT = "subject";
+    private static final String LOG_KEY_REAUTH = "reauth";
+    private static final String LOG_KEY_ERROR_CODE = "errorCode";
+    private static final String LOG_KEY_ERROR_TYPE = "errorType";
+
+    private static final String CLOSE_REASON_CLIENT_SASL_FRAME = "client-sasl-frame";
+    private static final String CLOSE_REASON_AUTH_FAILURE = "auth-failure";
+    private static final String CLOSE_REASON_REAUTH_FAILURE = "reauth-failure";
+    private static final String CLOSE_REASON_SUBJECT_CHANGE = "subject-change";
+    private static final String CLOSE_REASON_SESSION_EXPIRED = "session-expired";
 
     private final SaslInitiationConfig config;
     private final CredentialResolver credentialResolver;
@@ -227,9 +249,11 @@ final class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFi
                                                                        RequestHeaderData header,
                                                                        ApiMessage request,
                                                                        Errors error) {
-        LOGGER.atWarn()
-                .addKeyValue("errorCode", error.code())
+        structured(context, Level.WARN, false)
+                .addKeyValue(LOG_KEY_OUTCOME, SaslInitiationMetrics.OUTCOME_FAILURE)
+                .addKeyValue(LOG_KEY_ERROR_CODE, error.code())
                 .log("Rejecting client-originated SASL frame; client SASL must be terminated before SaslInitiation");
+        SaslInitiationMetrics.recordConnectionClosed(CLOSE_REASON_CLIENT_SASL_FRAME);
         failClosed();
         return context.requestFilterResultBuilder()
                 .errorResponse(header, request, error)
@@ -240,15 +264,20 @@ final class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFi
     private CompletionStage<RequestFilterResult> startAuthentication(FilterContext context,
                                                                      RequestHeaderData header,
                                                                      ApiMessage request) {
+        final String mechanism = config.mechanism().mechanismName();
+        final String virtualCluster = context.getVirtualClusterName();
+        final long startedAtMs = clock.millis();
         final CompletionStage<SaslExchangeState.AuthenticationResult> exchange;
         try {
             exchange = authenticate(context);
         }
         catch (RuntimeException e) {
-            LOGGER.atWarn()
-                    .addKeyValue("mechanism", config.mechanism())
-                    .addKeyValue("errorType", e.getClass().getSimpleName())
+            structured(context, Level.WARN, false)
+                    .addKeyValue(LOG_KEY_OUTCOME, SaslInitiationMetrics.OUTCOME_FAILURE)
+                    .addKeyValue(LOG_KEY_ERROR_CODE, Errors.UNKNOWN_SERVER_ERROR.code())
+                    .addKeyValue(LOG_KEY_ERROR_TYPE, e.getClass().getSimpleName())
                     .log("SASL initiation failed before starting the exchange");
+            recordAuthFailure(mechanism, virtualCluster, startedAtMs);
             state = new SaslExchangeState.Failed();
             return failureResult(context, header, request);
         }
@@ -258,7 +287,7 @@ final class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFi
         state = authenticating;
         exchange.whenComplete((result, error) -> {
             if (error != null) {
-                logExchangeFailure(error);
+                logExchangeFailure(context, false, error);
             }
             SaslExchangeState.AuthenticationResult outcome = error == null && result != null
                     ? result
@@ -278,6 +307,13 @@ final class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFi
                 else {
                     state = new SaslExchangeState.Failed();
                 }
+                boolean authenticated = outcome.authenticated();
+                SaslInitiationMetrics.recordAuthAttempt(mechanism, virtualCluster, authenticated);
+                SaslInitiationMetrics.recordAuthDuration(mechanism, virtualCluster,
+                        Duration.ofMillis(Math.max(0L, clock.millis() - startedAtMs)));
+                if (!authenticated) {
+                    SaslInitiationMetrics.recordConnectionClosed(CLOSE_REASON_AUTH_FAILURE);
+                }
             }
             stage.complete(outcome);
         });
@@ -287,6 +323,13 @@ final class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFi
                 : failureResult(context, header, request));
     }
 
+    private void recordAuthFailure(String mechanism, String virtualCluster, long startedAtMs) {
+        SaslInitiationMetrics.recordAuthAttempt(mechanism, virtualCluster, false);
+        SaslInitiationMetrics.recordAuthDuration(mechanism, virtualCluster,
+                Duration.ofMillis(Math.max(0L, clock.millis() - startedAtMs)));
+        SaslInitiationMetrics.recordConnectionClosed(CLOSE_REASON_AUTH_FAILURE);
+    }
+
     private CompletionStage<SaslExchangeState.AuthenticationResult> authenticate(FilterContext context) {
         final IdentitySnapshot identity;
         try {
@@ -294,13 +337,11 @@ final class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFi
             identityGuard.expect(identity);
         }
         catch (RuntimeException e) {
-            LOGGER.atWarn()
-                    .addKeyValue("mechanism", config.mechanism())
-                    .addKeyValue("errorType", e.getClass().getSimpleName())
+            structured(context, Level.WARN, false)
+                    .addKeyValue(LOG_KEY_OUTCOME, SaslInitiationMetrics.OUTCOME_FAILURE)
+                    .addKeyValue(LOG_KEY_ERROR_CODE, Errors.UNKNOWN_SERVER_ERROR.code())
+                    .addKeyValue(LOG_KEY_ERROR_TYPE, e.getClass().getSimpleName())
                     .log("SASL initiation could not select a broker identity");
-            LOGGER.atDebug()
-                    .setCause(e)
-                    .log("SASL initiation identity selection detail");
             return CompletableFuture.completedFuture(SaslExchangeState.AuthenticationResult.failure());
         }
 
@@ -316,16 +357,15 @@ final class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFi
             credential = resolvePasswordCredential(identity.lookupKey());
         }
         catch (RuntimeException e) {
-            logCredentialSelectionFailure(e);
+            logCredentialSelectionFailure(context, false, e);
             return CompletableFuture.completedFuture(SaslExchangeState.AuthenticationResult.failure());
         }
 
         final String subject = identity.lookupKey();
         final String brokerUsername = credential.username();
-        LOGGER.atDebug()
-                .addKeyValue("mechanism", config.mechanism())
-                .addKeyValue("subject", subject)
-                .addKeyValue("brokerUsername", brokerUsername)
+        structured(context, Level.DEBUG, false)
+                .addKeyValue(LOG_KEY_SUBJECT, subject)
+                .addKeyValue(LOG_KEY_BROKER_USERNAME, brokerUsername)
                 .log("Selected the broker credential for SASL initiation");
 
         return resolveApiVersions(context)
@@ -337,8 +377,9 @@ final class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFi
                                                                                             IdentitySnapshot identity) {
         final OAuthTokenService tokenService = oauthTokenService;
         if (tokenService == null) {
-            LOGGER.atWarn()
-                    .addKeyValue("mechanism", config.mechanism())
+            structured(context, Level.WARN, false)
+                    .addKeyValue(LOG_KEY_OUTCOME, SaslInitiationMetrics.OUTCOME_FAILURE)
+                    .addKeyValue(LOG_KEY_ERROR_CODE, Errors.UNKNOWN_SERVER_ERROR.code())
                     .log("SASL initiation has no OAuth token service configured");
             return CompletableFuture.completedFuture(SaslExchangeState.AuthenticationResult.failure());
         }
@@ -348,15 +389,14 @@ final class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFi
             credential = selectOAuthCredential(identity);
         }
         catch (RuntimeException e) {
-            logCredentialSelectionFailure(e);
+            logCredentialSelectionFailure(context, false, e);
             return CompletableFuture.completedFuture(SaslExchangeState.AuthenticationResult.failure());
         }
 
         final String subject = identity.lookupKey();
         final String tokenPrincipal = credential == null ? subject : credential.expectedSubject();
-        LOGGER.atDebug()
-                .addKeyValue("mechanism", config.mechanism())
-                .addKeyValue("subject", subject)
+        structured(context, Level.DEBUG, false)
+                .addKeyValue(LOG_KEY_SUBJECT, subject)
                 .addKeyValue("tokenPrincipal", tokenPrincipal)
                 .log("Selected the OAuth token source for SASL initiation");
 
@@ -405,7 +445,7 @@ final class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFi
                                                                                      CompletionStage<Long> exchange) {
         return exchange.handle((sessionLifetimeMs, error) -> {
             if (error != null) {
-                logExchangeFailure(error);
+                logExchangeFailure(context, false, error);
                 return SaslExchangeState.AuthenticationResult.failure();
             }
             try {
@@ -414,14 +454,19 @@ final class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFi
                 identityGuard.verify(context);
             }
             catch (RuntimeException e) {
-                logSubjectChangeFailure(e);
+                logSubjectChangeFailure(context, false, e);
                 return SaslExchangeState.AuthenticationResult.failure();
             }
-            LOGGER.atInfo()
-                    .addKeyValue("mechanism", config.mechanism())
-                    .addKeyValue("subject", subject)
-                    .addKeyValue("brokerIdentity", brokerIdentity)
-                    .log("SASL initiation authenticated the upstream connection");
+            LoggingEventBuilder event = structured(context, Level.INFO, false)
+                    .addKeyValue(LOG_KEY_OUTCOME, SaslInitiationMetrics.OUTCOME_SUCCESS)
+                    .addKeyValue(LOG_KEY_SUBJECT, subject);
+            if (config.mechanism() == Mechanism.OAUTHBEARER) {
+                event = event.addKeyValue("tokenPrincipal", brokerIdentity);
+            }
+            else {
+                event = event.addKeyValue(LOG_KEY_BROKER_USERNAME, brokerIdentity);
+            }
+            event.log("SASL initiation authenticated the upstream connection");
             return SaslExchangeState.AuthenticationResult.success(
                     Objects.requireNonNull(sessionLifetimeMs, "sessionLifetimeMs"),
                     versions,
@@ -438,6 +483,7 @@ final class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFi
         long now = clock.millis();
         if (deadline != null && deadline.isHardDeadlineReached(now)) {
             logReauthFailure(context, "hard-deadline", null);
+            SaslInitiationMetrics.recordConnectionClosed(CLOSE_REASON_SESSION_EXPIRED);
             failClosed();
             return failureResult(context, header, request);
         }
@@ -453,10 +499,10 @@ final class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFi
                                                                        SaslExchangeState.Authenticated authenticated) {
         reauthDue = false;
         cancelReauthTask();
-        LOGGER.atInfo()
-                .addKeyValue("mechanism", config.mechanism())
-                .addKeyValue("virtualCluster", context.getVirtualClusterName())
-                .addKeyValue("sessionId", context.sessionId())
+        final String mechanism = config.mechanism().mechanismName();
+        final String virtualCluster = context.getVirtualClusterName();
+        final long startedAtMs = clock.millis();
+        structured(context, Level.INFO, true)
                 .log("Starting KIP-368 SASL reauthentication");
 
         final CompletionStage<SaslExchangeState.AuthenticationResult> exchange;
@@ -465,6 +511,7 @@ final class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFi
         }
         catch (RuntimeException e) {
             logReauthFailure(context, "reauth-start", e);
+            recordReauthFailure(mechanism, virtualCluster, startedAtMs);
             failClosed();
             return failureResult(context, header, request);
         }
@@ -474,12 +521,13 @@ final class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFi
         state = reauthenticating;
         exchange.whenComplete((result, error) -> {
             if (error != null) {
-                logExchangeFailure(error);
+                logExchangeFailure(context, true, error);
             }
             SaslExchangeState.AuthenticationResult outcome = error == null && result != null
                     ? result
                     : SaslExchangeState.AuthenticationResult.failure();
-            if (state == reauthenticating && outcome.authenticated()) {
+            boolean ownsState = state == reauthenticating;
+            if (ownsState && outcome.authenticated()) {
                 state = new SaslExchangeState.Authenticated(
                         outcome.sessionLifetimeMs(),
                         Objects.requireNonNull(outcome.apiVersions(), "apiVersions"),
@@ -493,12 +541,21 @@ final class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFi
                     outcome = SaslExchangeState.AuthenticationResult.failure();
                 }
             }
-            else if (state == reauthenticating) {
+            else if (ownsState) {
                 state = new SaslExchangeState.Failed();
                 logReauthFailure(context, "reauth-exchange", error);
             }
             else {
                 outcome = SaslExchangeState.AuthenticationResult.failure();
+            }
+            if (ownsState) {
+                boolean authenticatedOutcome = outcome.authenticated();
+                SaslInitiationMetrics.recordReauthAttempt(mechanism, virtualCluster, authenticatedOutcome);
+                SaslInitiationMetrics.recordReauthDuration(mechanism, virtualCluster,
+                        Duration.ofMillis(Math.max(0L, clock.millis() - startedAtMs)));
+                if (!authenticatedOutcome) {
+                    SaslInitiationMetrics.recordConnectionClosed(CLOSE_REASON_REAUTH_FAILURE);
+                }
             }
             stage.complete(outcome);
         });
@@ -506,6 +563,13 @@ final class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFi
         return stage.thenCompose(result -> result.authenticated()
                 ? forwardWithIdentityCheck(context, header, request)
                 : failureResult(context, header, request));
+    }
+
+    private void recordReauthFailure(String mechanism, String virtualCluster, long startedAtMs) {
+        SaslInitiationMetrics.recordReauthAttempt(mechanism, virtualCluster, false);
+        SaslInitiationMetrics.recordReauthDuration(mechanism, virtualCluster,
+                Duration.ofMillis(Math.max(0L, clock.millis() - startedAtMs)));
+        SaslInitiationMetrics.recordConnectionClosed(CLOSE_REASON_REAUTH_FAILURE);
     }
 
     private CompletionStage<SaslExchangeState.AuthenticationResult> reauthenticate(FilterContext context,
@@ -519,7 +583,7 @@ final class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFi
             identityGuard.verify(context);
         }
         catch (RuntimeException e) {
-            logSubjectChangeFailure(e);
+            logSubjectChangeFailure(context, true, e);
             return CompletableFuture.completedFuture(SaslExchangeState.AuthenticationResult.failure());
         }
 
@@ -529,7 +593,7 @@ final class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFi
 
         return exchange.handle((result, error) -> {
             if (error != null) {
-                logExchangeFailure(error);
+                logExchangeFailure(context, true, error);
                 return SaslExchangeState.AuthenticationResult.failure();
             }
             try {
@@ -538,7 +602,7 @@ final class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFi
                 identityGuard.verify(context);
             }
             catch (RuntimeException e) {
-                logSubjectChangeFailure(e);
+                logSubjectChangeFailure(context, true, e);
                 return SaslExchangeState.AuthenticationResult.failure();
             }
             if (deadline.isHardDeadlineReached(clock.millis())) {
@@ -556,9 +620,14 @@ final class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFi
             credential = resolvePasswordCredential(authenticated.identity().lookupKey());
         }
         catch (RuntimeException e) {
-            logCredentialSelectionFailure(e);
+            logCredentialSelectionFailure(context, true, e);
             return CompletableFuture.completedFuture(SaslExchangeState.AuthenticationResult.failure());
         }
+
+        structured(context, Level.DEBUG, true)
+                .addKeyValue(LOG_KEY_SUBJECT, authenticated.identity().lookupKey())
+                .addKeyValue(LOG_KEY_BROKER_USERNAME, credential.username())
+                .log("Selected the broker credential for SASL reauthentication");
 
         return performPasswordExchange(context, credential, authenticated.apiVersions())
                 .thenApply(sessionLifetimeMs -> SaslExchangeState.AuthenticationResult.success(
@@ -572,8 +641,9 @@ final class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFi
                                                                                               SaslExchangeState.Authenticated authenticated) {
         final OAuthTokenService tokenService = oauthTokenService;
         if (tokenService == null) {
-            LOGGER.atWarn()
-                    .addKeyValue("mechanism", config.mechanism())
+            structured(context, Level.WARN, true)
+                    .addKeyValue(LOG_KEY_OUTCOME, SaslInitiationMetrics.OUTCOME_FAILURE)
+                    .addKeyValue(LOG_KEY_ERROR_CODE, Errors.UNKNOWN_SERVER_ERROR.code())
                     .log("SASL initiation has no OAuth token service configured for reauthentication");
             return CompletableFuture.completedFuture(SaslExchangeState.AuthenticationResult.failure());
         }
@@ -583,9 +653,15 @@ final class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFi
             credential = selectOAuthCredential(authenticated.identity());
         }
         catch (RuntimeException e) {
-            logCredentialSelectionFailure(e);
+            logCredentialSelectionFailure(context, true, e);
             return CompletableFuture.completedFuture(SaslExchangeState.AuthenticationResult.failure());
         }
+
+        structured(context, Level.DEBUG, true)
+                .addKeyValue(LOG_KEY_SUBJECT, authenticated.identity().lookupKey())
+                .addKeyValue("tokenPrincipal", credential == null ? authenticated.identity().lookupKey()
+                        : credential.expectedSubject())
+                .log("Selected the OAuth token source for SASL reauthentication");
 
         CompletionStage<OAuthBearerToken> tokenStage = tokenService.token(authenticated.identity().lookupKey(), credential);
         CompletionStage<OAuthBearerToken> dispatchStage = filterDispatchExecutor == null
@@ -625,10 +701,7 @@ final class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFi
             ReauthScheduler.Deadline deadline = schedule.get().deadline();
             reauthDeadline = deadline;
             reauthTask = schedule.get().cancellation();
-            LOGGER.atDebug()
-                    .addKeyValue("mechanism", config.mechanism())
-                    .addKeyValue("virtualCluster", context.getVirtualClusterName())
-                    .addKeyValue("sessionId", context.sessionId())
+            structured(context, Level.DEBUG, state instanceof SaslExchangeState.Reauthenticating)
                     .addKeyValue("reauthAtMs", deadline.reauthAtMs())
                     .addKeyValue("hardDeadlineMs", deadline.hardDeadlineMs())
                     .log("Armed KIP-368 SASL reauthentication");
@@ -636,10 +709,7 @@ final class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFi
         else {
             reauthDeadline = null;
             reauthTask = null;
-            LOGGER.atDebug()
-                    .addKeyValue("mechanism", config.mechanism())
-                    .addKeyValue("virtualCluster", context.getVirtualClusterName())
-                    .addKeyValue("sessionId", context.sessionId())
+            structured(context, Level.DEBUG, state instanceof SaslExchangeState.Reauthenticating)
                     .log("No positive SASL session lifetime; KIP-368 reauthentication will not be scheduled");
         }
         return true;
@@ -660,14 +730,12 @@ final class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFi
         state = new SaslExchangeState.Failed();
     }
 
-    private void logCredentialSelectionFailure(RuntimeException e) {
-        LOGGER.atWarn()
-                .addKeyValue("mechanism", config.mechanism())
-                .addKeyValue("errorType", e.getClass().getSimpleName())
+    private void logCredentialSelectionFailure(FilterContext context, boolean reauth, RuntimeException error) {
+        structured(context, Level.WARN, reauth)
+                .addKeyValue(LOG_KEY_OUTCOME, SaslInitiationMetrics.OUTCOME_FAILURE)
+                .addKeyValue(LOG_KEY_ERROR_CODE, Errors.UNKNOWN_SERVER_ERROR.code())
+                .addKeyValue(LOG_KEY_ERROR_TYPE, error.getClass().getSimpleName())
                 .log("SASL initiation could not select a usable broker credential");
-        LOGGER.atDebug()
-                .setCause(e)
-                .log("SASL initiation identity/credential selection detail");
     }
 
     private CompletionStage<RequestFilterResult> forwardWithIdentityCheck(FilterContext context,
@@ -677,44 +745,41 @@ final class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFi
             identityGuard.verify(context);
         }
         catch (RuntimeException e) {
-            logSubjectChangeFailure(e);
+            logSubjectChangeFailure(context, state instanceof SaslExchangeState.Reauthenticating, e);
+            SaslInitiationMetrics.recordConnectionClosed(CLOSE_REASON_SUBJECT_CHANGE);
             failClosed();
             return failureResult(context, header, request);
         }
         return context.forwardRequest(header, request);
     }
 
-    private void logSubjectChangeFailure(Throwable error) {
-        LOGGER.atWarn()
-                .addKeyValue("mechanism", config.mechanism())
-                .addKeyValue("errorType", error.getClass().getSimpleName())
+    private void logSubjectChangeFailure(FilterContext context, boolean reauth, Throwable error) {
+        structured(context, Level.WARN, reauth)
+                .addKeyValue(LOG_KEY_OUTCOME, SaslInitiationMetrics.OUTCOME_FAILURE)
+                .addKeyValue(LOG_KEY_ERROR_CODE, Errors.UNKNOWN_SERVER_ERROR.code())
+                .addKeyValue(LOG_KEY_ERROR_TYPE, error.getClass().getSimpleName())
                 .log("The downstream subject is no longer valid for this authenticated upstream connection");
-        LOGGER.atDebug()
-                .setCause(error)
-                .log("Downstream subject change detail");
     }
 
     private void logReauthSuccess(FilterContext context, SaslExchangeState.AuthenticationResult result) {
-        LOGGER.atInfo()
-                .addKeyValue("mechanism", config.mechanism())
-                .addKeyValue("virtualCluster", context.getVirtualClusterName())
-                .addKeyValue("sessionId", context.sessionId())
+        structured(context, Level.INFO, true)
+                .addKeyValue(LOG_KEY_OUTCOME, SaslInitiationMetrics.OUTCOME_SUCCESS)
+                .addKeyValue(LOG_KEY_SUBJECT, Objects.requireNonNull(result.identity(), "identity").lookupKey())
                 .addKeyValue("sessionLifetimeMs", result.sessionLifetimeMs())
                 .log("KIP-368 SASL reauthentication succeeded");
     }
 
     private void logReauthFailure(FilterContext context, String reason, @Nullable Throwable error) {
-        var event = LOGGER.atWarn()
-                .addKeyValue("mechanism", config.mechanism())
-                .addKeyValue("virtualCluster", context.getVirtualClusterName())
-                .addKeyValue("sessionId", context.sessionId())
-                .addKeyValue("errorCode", Errors.UNKNOWN_SERVER_ERROR.code())
+        LoggingEventBuilder event = structured(context, Level.WARN, true)
+                .addKeyValue(LOG_KEY_OUTCOME, SaslInitiationMetrics.OUTCOME_FAILURE)
+                .addKeyValue(LOG_KEY_ERROR_CODE, Errors.UNKNOWN_SERVER_ERROR.code())
                 .addKeyValue("reason", reason);
         if (error instanceof SaslExchangeException saslExchangeException) {
             event = event.addKeyValue("brokerErrorCode", saslExchangeException.brokerErrorCode());
+            event = event.addKeyValue("errorDetail", LogSanitizer.sanitize(saslExchangeException.getMessage()));
         }
         if (error != null) {
-            event = event.addKeyValue("errorType", error.getClass().getSimpleName());
+            event = event.addKeyValue(LOG_KEY_ERROR_TYPE, error.getClass().getSimpleName());
         }
         event.log("KIP-368 SASL reauthentication failed");
     }
@@ -732,8 +797,9 @@ final class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFi
                     Optional<SaslApiVersions> versions = SaslApiVersions.from(Objects.requireNonNull(response,
                             "ApiVersions response"));
                     if (versions.isEmpty()) {
-                        LOGGER.atWarn()
-                                .addKeyValue("mechanism", config.mechanism())
+                        structured(context, Level.WARN, false)
+                                .addKeyValue(LOG_KEY_OUTCOME, SaslInitiationMetrics.OUTCOME_FAILURE)
+                                .addKeyValue(LOG_KEY_ERROR_CODE, Errors.UNKNOWN_SERVER_ERROR.code())
                                 .log("The broker ApiVersions response has no usable SASL handshake/authenticate entries");
                         return CompletableFuture.failedFuture(new SaslExchangeException(
                                 "The broker does not advertise usable SASL API versions"));
@@ -751,10 +817,12 @@ final class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFi
                 .thenCompose(response -> {
                     Errors error = Errors.forCode(response.errorCode());
                     if (error != Errors.NONE) {
-                        LOGGER.atWarn()
-                                .addKeyValue("mechanism", config.mechanism())
+                        structured(context, Level.WARN, state instanceof SaslExchangeState.Reauthenticating)
+                                .addKeyValue(LOG_KEY_OUTCOME, SaslInitiationMetrics.OUTCOME_FAILURE)
+                                .addKeyValue(LOG_KEY_ERROR_CODE, Errors.UNKNOWN_SERVER_ERROR.code())
                                 .addKeyValue("brokerErrorCode", error.code())
-                                .addKeyValue("enabledMechanisms", String.join(",", response.mechanisms()))
+                                .addKeyValue("enabledMechanisms",
+                                        LogSanitizer.sanitize(String.join(",", response.mechanisms())))
                                 .log("The broker rejected the SASL handshake");
                         return CompletableFuture.failedFuture(new SaslExchangeException(
                                 "The broker rejected the SASL handshake", error.code()));
@@ -836,8 +904,9 @@ final class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFi
                 .thenCompose(response -> {
                     Errors error = Errors.forCode(response.errorCode());
                     if (error != Errors.NONE) {
-                        LOGGER.atWarn()
-                                .addKeyValue("mechanism", config.mechanism())
+                        structured(context, Level.WARN, state instanceof SaslExchangeState.Reauthenticating)
+                                .addKeyValue(LOG_KEY_OUTCOME, SaslInitiationMetrics.OUTCOME_FAILURE)
+                                .addKeyValue(LOG_KEY_ERROR_CODE, Errors.UNKNOWN_SERVER_ERROR.code())
                                 .addKeyValue("brokerErrorCode", error.code())
                                 .log("The broker rejected SASL authentication");
                         return CompletableFuture.failedFuture(new SaslExchangeException(
@@ -901,23 +970,25 @@ final class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFi
         }
     }
 
-    private static void logExchangeFailure(Throwable error) {
-        if (error instanceof SaslExchangeException saslExchangeException) {
-            LOGGER.atWarn()
-                    .addKeyValue("errorType", error.getClass().getSimpleName())
-                    .addKeyValue("brokerErrorCode", saslExchangeException.brokerErrorCode())
-                    .log("SASL initiation failed");
+    private LoggingEventBuilder structured(FilterContext context, Level level, boolean reauth) {
+        return LOGGER.atLevel(level)
+                .addKeyValue(LOG_KEY_SESSION_ID, context.sessionId())
+                .addKeyValue(LOG_KEY_VIRTUAL_CLUSTER, context.getVirtualClusterName())
+                .addKeyValue(LOG_KEY_MECHANISM, config.mechanism().mechanismName())
+                .addKeyValue(LOG_KEY_REAUTH, reauth);
+    }
+
+    private void logExchangeFailure(FilterContext context, boolean reauth, Throwable error) {
+        Throwable cause = error instanceof CompletionException && error.getCause() != null ? error.getCause() : error;
+        LoggingEventBuilder event = structured(context, Level.WARN, reauth)
+                .addKeyValue(LOG_KEY_OUTCOME, SaslInitiationMetrics.OUTCOME_FAILURE)
+                .addKeyValue(LOG_KEY_ERROR_CODE, Errors.UNKNOWN_SERVER_ERROR.code())
+                .addKeyValue(LOG_KEY_ERROR_TYPE, cause.getClass().getSimpleName());
+        if (cause instanceof SaslExchangeException saslExchangeException) {
+            event = event.addKeyValue("brokerErrorCode", saslExchangeException.brokerErrorCode())
+                    .addKeyValue("errorDetail", LogSanitizer.sanitize(saslExchangeException.getMessage()));
         }
-        else {
-            LOGGER.atWarn()
-                    .addKeyValue("errorType", error.getClass().getSimpleName())
-                    .log("SASL initiation failed");
-        }
-        if (error.getCause() != null) {
-            LOGGER.atDebug()
-                    .setCause(error.getCause())
-                    .log("SASL initiation failure detail");
-        }
+        event.log("SASL initiation failed");
     }
 
 }

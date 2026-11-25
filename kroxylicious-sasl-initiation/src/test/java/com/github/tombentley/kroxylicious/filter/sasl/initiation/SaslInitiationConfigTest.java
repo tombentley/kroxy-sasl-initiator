@@ -519,6 +519,15 @@ class SaslInitiationConfigTest {
         assertThat(config.toString()).doesNotContain("super-secret");
     }
 
+    @Test
+    void keyStoreConfigToStringRedactsPasswordProvider() {
+        KeyStoreConfig config = new KeyStoreConfig("/tmp/store.p12", new InlinePassword("super-secret"));
+
+        assertThat(config.toString())
+                .doesNotContain("super-secret")
+                .contains("filePassword=REDACTED");
+    }
+
     private static KeyStoreConfig keyStore() {
         return new KeyStoreConfig("/tmp/store.p12", new InlinePassword("store-password"));
     }

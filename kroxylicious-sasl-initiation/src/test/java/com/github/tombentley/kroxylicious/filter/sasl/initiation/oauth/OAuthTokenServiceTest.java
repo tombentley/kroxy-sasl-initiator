@@ -35,12 +35,19 @@ import org.apache.logging.log4j.core.appender.AbstractAppender;
 import org.apache.logging.log4j.core.config.Configuration;
 import org.apache.logging.log4j.core.config.LoggerConfig;
 import org.apache.logging.log4j.core.config.Property;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.config.IdentityMode;
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.config.OAuthBearerConfig;
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.credentials.DestroyableSecret;
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.credentials.OAuthClientCredential;
+import com.github.tombentley.kroxylicious.filter.sasl.initiation.metrics.SaslInitiationMetrics;
+
+import io.micrometer.core.instrument.Metrics;
+import io.micrometer.core.instrument.Timer;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -53,6 +60,21 @@ class OAuthTokenServiceTest {
     private static final String EXPECTED_SUBJECT = "alice";
 
     private final MutableClock clock = new MutableClock(1_000_000L);
+    private SimpleMeterRegistry registry;
+
+    @BeforeEach
+    void setUpMetrics() {
+        Metrics.globalRegistry.clear();
+        registry = new SimpleMeterRegistry();
+        Metrics.globalRegistry.add(registry);
+    }
+
+    @AfterEach
+    void tearDownMetrics() {
+        Metrics.globalRegistry.remove(registry);
+        registry.close();
+        Metrics.globalRegistry.clear();
+    }
 
     @Test
     void returnsACachedTokenForTheSameIdentity() {
@@ -202,6 +224,47 @@ class OAuthTokenServiceTest {
                     .hasMessageContaining("validation failed")
                     .satisfies(error -> assertThat(error.getMessage()).doesNotContain(CLIENT_SECRET, TOKEN_VALUE));
         }
+    }
+
+    @Test
+    void recordsSuccessfulTokenRetrievalDuration() {
+        FakeRetriever retriever = new FakeRetriever(clock, TOKEN_VALUE, EXPECTED_SUBJECT, 60_000, 1);
+        FakeValidator validator = new FakeValidator(retriever);
+        try (OAuthTokenService service = service(retriever, validator, Runnable::run)) {
+            service.token(EXPECTED_SUBJECT, credential(EXPECTED_SUBJECT)).toCompletableFuture().join();
+        }
+
+        Timer success = registry.find(SaslInitiationMetrics.TOKEN_RETRIEVAL_DURATION_METRIC)
+                .tag(SaslInitiationMetrics.OUTCOME_TAG, SaslInitiationMetrics.OUTCOME_SUCCESS)
+                .timer();
+        assertThat(success).isNotNull();
+        assertThat(success.count()).isEqualTo(1);
+        assertThat(registry.find(SaslInitiationMetrics.TOKEN_RETRIEVAL_DURATION_METRIC)
+                .tag(SaslInitiationMetrics.OUTCOME_TAG, SaslInitiationMetrics.OUTCOME_FAILURE)
+                .timer()).isNull();
+        assertThat(registry.getMeters()).allSatisfy(meter -> assertThat(meter.getId().getTags())
+                .extracting(tag -> tag.getKey())
+                .isSubsetOf(java.util.Set.of(SaslInitiationMetrics.OUTCOME_TAG)));
+    }
+
+    @Test
+    void recordsFailedTokenRetrievalDuration() {
+        FakeRetriever retriever = new FakeRetriever(clock, TOKEN_VALUE, EXPECTED_SUBJECT, 60_000, 1);
+        retriever.retrievalFailure = new JwtRetrieverException("failed with secret " + CLIENT_SECRET);
+        FakeValidator validator = new FakeValidator(retriever);
+        try (OAuthTokenService service = service(retriever, validator, Runnable::run)) {
+            assertThatThrownBy(() -> service.token(EXPECTED_SUBJECT, credential(EXPECTED_SUBJECT)).toCompletableFuture().join())
+                    .hasRootCauseInstanceOf(OAuthTokenException.class);
+        }
+
+        Timer failure = registry.find(SaslInitiationMetrics.TOKEN_RETRIEVAL_DURATION_METRIC)
+                .tag(SaslInitiationMetrics.OUTCOME_TAG, SaslInitiationMetrics.OUTCOME_FAILURE)
+                .timer();
+        assertThat(failure).isNotNull();
+        assertThat(failure.count()).isEqualTo(1);
+        assertThat(registry.find(SaslInitiationMetrics.TOKEN_RETRIEVAL_DURATION_METRIC)
+                .tag(SaslInitiationMetrics.OUTCOME_TAG, SaslInitiationMetrics.OUTCOME_SUCCESS)
+                .timer()).isNull();
     }
 
     @Test
