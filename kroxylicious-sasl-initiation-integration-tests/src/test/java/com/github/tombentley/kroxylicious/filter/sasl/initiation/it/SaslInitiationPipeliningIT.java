@@ -79,16 +79,24 @@ class SaslInitiationPipeliningIT {
                     .isEqualTo(Errors.NONE);
             counter.set(0);
 
-            List<CompletableFuture<Response>> responses = pipeline(client, "pipeline");
+            // Trigger authentication with a single request, then wait until its upstream SaslAuthenticate response is
+            // held by the gate. Waiting first makes the in-flight count deterministic: pipelining the remaining
+            // requests before the deferred stage is established races with the runtime's read batch.
+            CompletableFuture<Response> trigger = client.get(metadataRequest("pipeline-trigger"));
             assertThat(gate.awaitBlocked(WAIT)).isTrue();
+            assertThat(counter.get()).isEqualTo(1);
+            assertThat(tester.getRequestsForApiKey(ApiKeys.METADATA)).isEmpty();
 
+            List<CompletableFuture<Response>> responses = new ArrayList<>();
+            responses.add(trigger);
+            responses.addAll(pipeline(client, "pipeline"));
             assertThat(counter.get()).isEqualTo(1);
             assertThat(tester.getRequestsForApiKey(ApiKeys.METADATA)).isEmpty();
 
             gate.release();
             CompletableFuture.allOf(responses.toArray(CompletableFuture[]::new)).get(WAIT.toSeconds(), TimeUnit.SECONDS);
 
-            assertThat(counter.get()).isEqualTo(PIPELINED_REQUESTS);
+            assertThat(counter.get()).isEqualTo(PIPELINED_REQUESTS + 1);
             assertOrderedMetadataRequests(tester, "pipeline");
         }
         finally {
@@ -245,7 +253,7 @@ class SaslInitiationPipeliningIT {
 
     private static void assertOrderedMetadataRequests(MockServerKroxyliciousTester tester, String prefix) {
         List<Request> metadataRequests = tester.getRequestsForApiKey(ApiKeys.METADATA);
-        assertThat(metadataRequests).hasSize(PIPELINED_REQUESTS + ("reauth".equals(prefix) ? 2 : 0));
+        assertThat(metadataRequests).hasSize(PIPELINED_REQUESTS + ("reauth".equals(prefix) ? 2 : 1));
         assertThat(metadataRequests)
                 .extracting(Request::clientIdHeader)
                 .containsExactlyElementsOf(expectedClientIds(prefix));
@@ -255,8 +263,8 @@ class SaslInitiationPipeliningIT {
         List<String> clientIds = new ArrayList<>();
         if ("reauth".equals(prefix)) {
             clientIds.add("reauth-initial");
-            clientIds.add("reauth-trigger");
         }
+        clientIds.add(prefix + "-trigger");
         IntStream.range(0, PIPELINED_REQUESTS).mapToObj(index -> prefix + "-" + index).forEach(clientIds::add);
         return clientIds;
     }
