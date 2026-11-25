@@ -6,6 +6,7 @@
 
 package com.github.tombentley.kroxylicious.filter.sasl.initiation;
 
+import org.apache.kafka.common.security.oauthbearer.JwtRetriever;
 import org.junit.jupiter.api.Test;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -14,6 +15,7 @@ import com.github.tombentley.kroxylicious.filter.sasl.initiation.config.Identity
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.config.IdentityMode;
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.config.KeyStoreConfig;
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.config.Mechanism;
+import com.github.tombentley.kroxylicious.filter.sasl.initiation.config.OAuthBearerConfig;
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.config.ReauthConfig;
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.config.SaslInitiationConfig;
 
@@ -99,16 +101,29 @@ class SaslInitiationConfigTest {
     @Test
     void parsesAllSupportedMechanisms() throws Exception {
         for (Mechanism mechanism : Mechanism.values()) {
-            String yamlConfig = """
-                    mechanism: %s
-                    identity:
-                      mode: fixed
-                      key: alice
-                    keyStore:
-                      file: /etc/kroxylicious/sasl-initiation.p12
-                      filePassword:
-                        password: store-password
-                    """.formatted(mechanism.mechanismName());
+            String yamlConfig;
+            if (mechanism == Mechanism.OAUTHBEARER) {
+                yamlConfig = """
+                        mechanism: %s
+                        identity:
+                          mode: fixed
+                          key: alice
+                        oauthBearer:
+                          tokenEndpointUrl: file:/etc/kroxylicious/token.jwt
+                        """.formatted(mechanism.mechanismName());
+            }
+            else {
+                yamlConfig = """
+                        mechanism: %s
+                        identity:
+                          mode: fixed
+                          key: alice
+                        keyStore:
+                          file: /etc/kroxylicious/sasl-initiation.p12
+                          filePassword:
+                            password: store-password
+                        """.formatted(mechanism.mechanismName());
+            }
 
             assertThat(yaml.readValue(yamlConfig, SaslInitiationConfig.class).mechanism()).isEqualTo(mechanism);
         }
@@ -140,10 +155,11 @@ class SaslInitiationConfigTest {
 
     @Test
     void rejectsUnknownMechanism() {
-        assertThatThrownBy(() -> Mechanism.fromString("OAUTHBEARER"))
+        assertThatThrownBy(() -> Mechanism.fromString("GSSAPI"))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("Unsupported mechanism")
-                .hasMessageContaining("PLAIN");
+                .hasMessageContaining("PLAIN")
+                .hasMessageContaining("OAUTHBEARER");
 
         String yamlConfig = """
                 mechanism: GSSAPI
@@ -342,12 +358,174 @@ class SaslInitiationConfigTest {
     }
 
     @Test
+    void parsesOAuthBearerFixedFileConfigurationWithoutKeyStore() throws Exception {
+        String yamlConfig = """
+                mechanism: OAUTHBEARER
+                identity:
+                  mode: fixed
+                  key: proxy-service
+                oauthBearer:
+                  tokenEndpointUrl: file:/etc/kroxylicious/token.jwt
+                  scope: kafka
+                """;
+
+        SaslInitiationConfig config = yaml.readValue(yamlConfig, SaslInitiationConfig.class);
+
+        assertThat(config.mechanism()).isEqualTo(Mechanism.OAUTHBEARER);
+        assertThat(config.keyStore()).isNull();
+        assertThat(config.oauthBearer().tokenEndpointUrl()).isEqualTo("file:/etc/kroxylicious/token.jwt");
+        assertThat(config.oauthBearer().scope()).isEqualTo("kafka");
+        assertThat(config.oauthBearer().jwtRetriever()).isEqualTo(OAuthBearerConfig.DEFAULT_JWT_RETRIEVER);
+        assertThat(config.oauthBearer().subjectClaimName()).isEqualTo("sub");
+    }
+
+    @Test
+    void parsesOAuthBearerFixedHttpConfigurationWithKeyStore() throws Exception {
+        String yamlConfig = """
+                mechanism: OAUTHBEARER
+                identity:
+                  mode: fixed
+                  key: proxy-service
+                keyStore:
+                  file: /etc/kroxylicious/sasl-initiation.p12
+                  filePassword:
+                    password: store-password
+                oauthBearer:
+                  tokenEndpointUrl: https://idp.example.com/token
+                  subjectClaimName: preferred_username
+                """;
+
+        SaslInitiationConfig config = yaml.readValue(yamlConfig, SaslInitiationConfig.class);
+
+        assertThat(config.keyStore()).isNotNull();
+        assertThat(config.oauthBearer().subjectClaimName()).isEqualTo("preferred_username");
+    }
+
+    @Test
+    void rejectsOAuthBearerMissingConfigurationGroup() {
+        assertThatThrownBy(() -> new SaslInitiationConfig(
+                Mechanism.OAUTHBEARER,
+                new IdentityConfig(IdentityMode.FIXED, "alice"),
+                null))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("oauthBearer is required");
+    }
+
+    @Test
+    void rejectsOAuthBearerGroupForOtherMechanisms() {
+        assertThatThrownBy(() -> new SaslInitiationConfig(
+                Mechanism.PLAIN,
+                new IdentityConfig(IdentityMode.FIXED, "alice"),
+                keyStore(),
+                new OAuthBearerConfig("file:/tmp/token.jwt", null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("oauthBearer is only valid");
+    }
+
+    @Test
+    void requiresKeyStoreForOAuthBearerSubjectMode() {
+        assertThatThrownBy(() -> new SaslInitiationConfig(
+                Mechanism.OAUTHBEARER,
+                new IdentityConfig(IdentityMode.SUBJECT, null),
+                null,
+                new OAuthBearerConfig("https://idp.example.com/token", null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("keyStore is required");
+    }
+
+    @Test
+    void rejectsOAuthBearerTokenFileInSubjectMode() {
+        assertThatThrownBy(() -> new SaslInitiationConfig(
+                Mechanism.OAUTHBEARER,
+                new IdentityConfig(IdentityMode.SUBJECT, null),
+                keyStore(),
+                new OAuthBearerConfig("file:/tmp/token.jwt", null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("token files are only valid with a fixed identity");
+    }
+
+    @Test
+    void requiresKeyStoreForOAuthBearerFixedHttpClientCredentials() {
+        assertThatThrownBy(() -> new SaslInitiationConfig(
+                Mechanism.OAUTHBEARER,
+                new IdentityConfig(IdentityMode.FIXED, "alice"),
+                null,
+                new OAuthBearerConfig("https://idp.example.com/token", null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("keyStore is required");
+    }
+
+    @Test
+    void rejectsKeyStoreForOAuthBearerFixedFileToken() {
+        assertThatThrownBy(() -> new SaslInitiationConfig(
+                Mechanism.OAUTHBEARER,
+                new IdentityConfig(IdentityMode.FIXED, "alice"),
+                keyStore(),
+                new OAuthBearerConfig("file:/tmp/token.jwt", null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("keyStore is not used");
+    }
+
+    @Test
+    void validatesOAuthBearerTokenEndpointUrl() {
+        assertThatThrownBy(() -> new OAuthBearerConfig(null, null))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("tokenEndpointUrl is required");
+        assertThatThrownBy(() -> new OAuthBearerConfig(" ", null))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("tokenEndpointUrl is required");
+        assertThatThrownBy(() -> new OAuthBearerConfig("ftp://idp.example.com/token", null))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("file, http or https");
+        assertThatThrownBy(() -> new OAuthBearerConfig("not a uri", null))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("not a valid URI");
+        assertThatThrownBy(() -> new OAuthBearerConfig("file:", null))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("not a valid URI");
+        assertThatThrownBy(() -> new OAuthBearerConfig("https://", null))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("not a valid URI");
+        assertThat(new OAuthBearerConfig("HTTP://idp.example.com/token", null).isFileTokenEndpoint()).isFalse();
+        assertThat(new OAuthBearerConfig("FILE:/tmp/token.jwt", null).isFileTokenEndpoint()).isTrue();
+    }
+
+    @Test
+    void validatesOAuthBearerRetrieverAndSubjectClaimName() {
+        assertThatThrownBy(() -> new OAuthBearerConfig("file:/tmp/token.jwt", null, "does.not.Exist", null))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("was not found");
+        assertThatThrownBy(() -> new OAuthBearerConfig("file:/tmp/token.jwt", null, String.class.getName(), null))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("does not implement");
+        assertThatThrownBy(() -> new OAuthBearerConfig("file:/tmp/token.jwt", null, TestJwtRetriever.class.getName(), " "))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("subjectClaimName must not be blank");
+        assertThatThrownBy(() -> new OAuthBearerConfig("file:/tmp/token.jwt", " ", null, null))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("scope must not be blank");
+
+        OAuthBearerConfig config = new OAuthBearerConfig("file:/tmp/token.jwt", null, TestJwtRetriever.class.getName(), null);
+        assertThat(config.jwtRetrieverClass()).isEqualTo(TestJwtRetriever.class);
+        assertThat(config.subjectClaimName()).isEqualTo("sub");
+    }
+
+    @Test
     void configToStringDoesNotContainInlinePassword() {
         SaslInitiationConfig config = new SaslInitiationConfig(Mechanism.PLAIN,
                 new IdentityConfig(IdentityMode.FIXED, "alice"),
                 new KeyStoreConfig("/tmp/store.p12", new InlinePassword("super-secret")));
 
         assertThat(config.toString()).doesNotContain("super-secret");
+    }
+
+    @Test
+    void keyStoreConfigToStringRedactsPasswordProvider() {
+        KeyStoreConfig config = new KeyStoreConfig("/tmp/store.p12", new InlinePassword("super-secret"));
+
+        assertThat(config.toString())
+                .doesNotContain("super-secret")
+                .contains("filePassword=REDACTED");
     }
 
     private static KeyStoreConfig keyStore() {
@@ -358,4 +536,12 @@ class SaslInitiationConfigTest {
     public record CustomPrincipal(String name) implements Principal {}
 
     public record NotSingularPrincipal(String name) implements Principal {}
+
+    public static class TestJwtRetriever implements JwtRetriever {
+
+        @Override
+        public String retrieve() {
+            return "unused";
+        }
+    }
 }

@@ -31,8 +31,6 @@ import io.kroxylicious.testing.filter.context.MockFilterContext;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.when;
 
 @SuppressWarnings({ "deprecation", "removal", "java:S5738" })
 class IdentitySelectionTest {
@@ -117,17 +115,12 @@ class IdentitySelectionTest {
     }
 
     @Test
-    void subjectSelectorFailsClosedWhenPrincipalTypeIsAmbiguous() {
-        Subject subject = mock(Subject.class);
-        when(subject.principals()).thenReturn(Set.of(
+    void singularPrincipalTypeCannotAppearMoreThanOnceInASubject() {
+        assertThatThrownBy(() -> new Subject(Set.of(
                 new CustomPrincipal("first"),
-                new CustomPrincipal("second")));
-        SubjectIdentitySelector selector = new SubjectIdentitySelector(CustomPrincipal.class);
-
-        assertThatThrownBy(() -> selector.select(contextFor(subject)))
-                .isInstanceOf(IdentitySelectionException.class)
-                .hasMessageContaining("2 principals")
-                .hasMessageContaining(CustomPrincipal.class.getName());
+                new CustomPrincipal("second"))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("singular principal type");
     }
 
     @Test

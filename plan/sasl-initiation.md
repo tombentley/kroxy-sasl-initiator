@@ -242,7 +242,79 @@ Reasons:
 * Per-route placement gives each leaf route its own filter instance and authentication state, so a client connection that fans out to multiple routes authenticates each upstream connection independently. Each route can also have its own filter definition and KeyStore, enabling per-target credentials.
 * The client subject remains available to a route filter through `FilterContext.authenticatedSubject()`; the initiator only reads it and never changes it.
 
-For a non-routing/direct deployment, the filter goes last on the virtual-cluster chain as shown above. The plan's tests must cover both placements.
+Each leaf route can have its own filter definition and credential store:
+
+```yaml
+filterDefinitions:
+  - name: sasl-initiation-route-a
+    type: SaslInitiation
+    config:
+      mechanism: SCRAM-SHA-256
+      identity:
+        mode: fixed
+        key: route-a-service
+      keyStore:
+        file: /etc/kroxylicious/route-a.p12
+        filePassword:
+          passwordFile: /etc/kroxylicious/route-a.p12.password
+  - name: sasl-initiation-route-b
+    type: SaslInitiation
+    config:
+      mechanism: SCRAM-SHA-256
+      identity:
+        mode: fixed
+        key: route-b-service
+      keyStore:
+        file: /etc/kroxylicious/route-b.p12
+        filePassword:
+          passwordFile: /etc/kroxylicious/route-b.p12.password
+
+clusterDefinitions:
+  - name: cluster-a
+    bootstrapServers: kafka-a.example.com:9092
+  - name: cluster-b
+    bootstrapServers: kafka-b.example.com:9092
+
+routerDefinitions:
+  - name: leaf-router
+    type: <router plugin type>
+    config: {}
+    routes:
+      - name: route-a
+        id: 0
+        filters: [sasl-initiation-route-a]
+        target:
+          cluster: cluster-a
+      - name: route-b
+        id: 1
+        filters: [sasl-initiation-route-b]
+        target:
+          cluster: cluster-b
+
+virtualClusters:
+  - name: demo
+    target:
+      router: leaf-router
+    # Optional client-facing authentication, but never SaslInitiation here.
+    filters: [sasl-termination]
+    gateways:
+      - name: default
+        portIdentifiesNode:
+          bootstrapAddress: localhost:9192
+```
+
+The virtual cluster's `filters` must not contain `SaslInitiation` when `target.router` is used. A
+virtual-cluster-level initiator runs before target selection: it cannot authenticate every leaf route, and its
+internally generated `ApiVersions`/`SaslHandshake` frames may go to the wrong upstream (or to no target). The runtime
+does not currently reject this placement, so it is a documented operational constraint and is covered by a routing
+integration test that asserts the second route receives no SASL handshake.
+
+For independent per-route credentials, each leaf route must target its own upstream cluster/connection. Routes that
+resolve to the same upstream address can share an upstream connection, so per-route filters cannot be relied on to
+separate credentials for the same broker connection.
+
+For a non-routing/direct deployment, the filter goes last on the virtual-cluster chain as shown above. The plan's tests
+must cover both placements.
 
 ### 6.2 Trigger point
 
@@ -250,8 +322,8 @@ The filter has no connection-established callback in the current `Filter` API. I
 
 Chosen rule:
 
-1. Forward the client's initial `ApiVersions` request/response normally, and cache the SASL API versions from the response for later use. This is important for subject mode: with `SaslTermination`, the client must complete its `ApiVersions` + SASL exchange before a subject exists. Holding `ApiVersions` would deadlock.
-2. On the first request that is **not** `ApiVersions` (and not a client SASL frame, which is rejected):
+1. Forward the client's initial `ApiVersions` request/response normally, and cache the SASL API versions from the response for later use. This is important for subject mode: with `SaslTermination`, the client must complete its `ApiVersions` + SASL exchange before a subject exists. Holding `ApiVersions` would deadlock. Only the first client `ApiVersions` exchange is forwarded before initiation. A Kafka client can send a second `ApiVersions` request after client SASL termination; forwarding it while the broker is still waiting for the proxy-initiated `SaslHandshake` makes the broker reject it as an unexpected `ApiVersions` request. Such a second `ApiVersions` request is therefore treated as the trigger and forwarded only after upstream authentication completes.
+2. On the first request that is **not** `ApiVersions` (and not a client SASL frame, which is rejected), or on a subsequent `ApiVersions` request after the initial one:
    * fixed mode: start upstream authentication immediately;
    * subject mode: resolve the subject; if eligible, start upstream authentication; otherwise fail closed.
 3. If the filter has not seen a usable client `ApiVersions` response (for example, because routing sent it to a different route, or the client omitted it), send the filter's own v0 `ApiVersions` request before the handshake.

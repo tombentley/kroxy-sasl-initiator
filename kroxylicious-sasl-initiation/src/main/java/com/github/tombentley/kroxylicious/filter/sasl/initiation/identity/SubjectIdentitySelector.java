@@ -15,8 +15,9 @@ import io.kroxylicious.proxy.filter.FilterContext;
 /**
  * An identity selector that derives the lookup key from the current downstream subject.
  * <p>
- * The subject is read at request time. There is no fixed fallback: anonymous subjects, subjects without a principal of
- * the configured type, and subjects with multiple principals of that type all fail closed.
+ * The subject is read at request time. There is no fixed fallback: anonymous subjects and subjects without a principal
+ * of the configured type fail closed. The configured type is required to be a singular principal type, which identity
+ * implementations guarantee to contain at most once, so there is no per-request ambiguity check.
  * </p>
  */
 public final class SubjectIdentitySelector implements IdentitySelector {

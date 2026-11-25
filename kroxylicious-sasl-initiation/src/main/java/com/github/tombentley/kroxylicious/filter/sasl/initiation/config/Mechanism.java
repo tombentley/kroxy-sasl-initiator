@@ -17,8 +17,7 @@ import com.github.tombentley.kroxylicious.filter.sasl.initiation.credentials.Cre
  * The SASL mechanism the filter uses to authenticate to the upstream broker.
  * <p>
  * The enum constant names are Java-friendly, while {@link #mechanismName()} is the IANA mechanism name used in
- * configuration. OAUTHBEARER is deliberately absent from this commit; it is added with its dedicated configuration
- * group later.
+ * configuration.
  * </p>
  */
 public enum Mechanism {
@@ -36,7 +35,12 @@ public enum Mechanism {
     /**
      * SCRAM using SHA-512.
      */
-    SCRAM_SHA_512("SCRAM-SHA-512", CredentialKind.PASSWORD);
+    SCRAM_SHA_512("SCRAM-SHA-512", CredentialKind.PASSWORD),
+
+    /**
+     * OAuth 2.0 bearer token.
+     */
+    OAUTHBEARER("OAUTHBEARER", CredentialKind.OAUTH);
 
     private final String mechanismName;
     private final CredentialKind credentialKind;

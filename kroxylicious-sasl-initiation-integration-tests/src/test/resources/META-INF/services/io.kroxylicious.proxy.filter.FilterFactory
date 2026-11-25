@@ -1,0 +1,6 @@
+com.github.tombentley.kroxylicious.filter.sasl.initiation.it.FixedSubjectFilter
+com.github.tombentley.kroxylicious.filter.sasl.initiation.it.CompositionObserverFilter
+com.github.tombentley.kroxylicious.filter.sasl.initiation.it.SubjectSwitcherFilter
+com.github.tombentley.kroxylicious.filter.sasl.initiation.it.SaslResponseDelayFilter
+com.github.tombentley.kroxylicious.filter.sasl.initiation.it.RequestCountingFilter
+com.github.tombentley.kroxylicious.filter.sasl.initiation.it.RouteInitiationObserverFilter

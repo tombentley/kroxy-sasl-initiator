@@ -14,16 +14,24 @@ import javax.security.sasl.Sasl;
 import javax.security.sasl.SaslClient;
 import javax.security.sasl.SaslException;
 
+import org.apache.kafka.common.security.scram.internals.ScramSaslClientProvider;
+
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.config.Mechanism;
-import com.github.tombentley.kroxylicious.filter.sasl.initiation.credentials.PasswordCredential;
 
 /**
- * A mechanism driver for SASL mechanisms that use the JDK's password-based client implementations.
+ * A mechanism driver for SASL mechanisms that use the JDK's or Kafka's password-based client implementations.
  * <p>
- * This commit implements PLAIN. SCRAM is added by the next commit without changing the exchange state machine.
+ * PLAIN is provided by the JDK. SCRAM-SHA-256 and SCRAM-SHA-512 are provided by Kafka, so the Kafka
+ * {@link ScramSaslClientProvider} must be registered before creating those clients. The challenge/response state
+ * machine remains mechanism agnostic.
  * </p>
  */
 final class PasswordMechanismDriver implements MechanismDriver {
+
+    static {
+        // Registers the Kafka SCRAM SASL client factories. The JDK does not provide SCRAM.
+        ScramSaslClientProvider.initialize();
+    }
 
     private final Mechanism mechanism;
 
@@ -37,13 +45,10 @@ final class PasswordMechanismDriver implements MechanismDriver {
     }
 
     @Override
-    public SaslClient createSaslClient(PasswordCredential credential, CallbackHandler callbackHandler) throws SaslException {
-        if (mechanism != Mechanism.PLAIN) {
-            throw new SaslException("SASL mechanism " + mechanism.mechanismName() + " is not implemented by this version");
-        }
+    public SaslClient createSaslClient(CallbackHandler callbackHandler) throws SaslException {
         Map<String, Object> configs = Map.of();
         SaslClient client = Sasl.createSaslClient(
-                new String[]{ Mechanism.PLAIN.mechanismName() },
+                new String[]{ mechanism.mechanismName() },
                 null,
                 null,
                 "localhost",

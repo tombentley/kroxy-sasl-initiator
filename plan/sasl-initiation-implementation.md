@@ -140,8 +140,8 @@ com.github.tombentley.kroxylicious.filter.sasl.initiation.cli           # CLI (i
    `io.kroxylicious.proxy.authentication.Subject`; `User` is in the same package. Isolate all use of these types in one
    `IdentityAdapter` class, and use `io.kroxylicious.identity.Principal` where possible, so the 1.0 migration is local.
 7. **Client authentication composition.** In 0.26.0, `SaslTermination` supports SCRAM and OAUTHBEARER, not PLAIN. The
-   design's "SaslTermination with PLAIN" example is not directly testable with released code; tests use SCRAM/OAUTH, or a
-   test-only PLAIN terminator if needed. Record this in docs.
+   design's "SaslTermination with PLAIN" example is not directly testable with released code; composition tests use SCRAM
+   termination. This commit does not add a test-only PLAIN terminator, so no PLAIN-termination result is claimed.
 8. **Test support.** Use the published test-support jars rather than reinventing:
 
    | Artifact | Use |
@@ -1060,25 +1060,42 @@ misconfiguration fails safely.
 
 **Adds**
 
-* Integration-test dependency on `kroxylicious-sasl-termination` and the file-backed SCRAM credential store.
+* Integration-test dependencies on `kroxylicious-sasl-termination` and
+  `kroxylicious-scram-credential-store-provider-file` (0.26.0).
+* Separate PKCS12 files for `SaslTermination` client credentials and `SaslInitiation` upstream credentials, with
+  different store passwords, so the tests exercise D17 rather than sharing one store.
+* A test-only `CompositionObserverFilter`, placed after `SaslInitiation`, that parses the initiator's own PLAIN/SCRAM
+  handshake/auth frames, records the broker authorization id and upstream mechanism, and adds those plus the downstream
+  subject to produced record headers. This verifies the broker-visible identity without relying only on a successful
+  produce.
 * ITs for:
-  * `SaslTermination` SCRAM client -> `SaslInitiation` PLAIN upstream.
-  * `SaslTermination` SCRAM client -> `SaslInitiation` SCRAM-SHA-512 upstream (mechanism translation).
-  * per-user credentials and mapped usernames.
-  * mTLS client -> `SaslInitiation` SCRAM upstream, using `KeytoolCertificateGenerator`/`@Tls`.
-  * anonymous client -> fixed identity upstream (already covered, repeated in composition).
-  * subject mode with anonymous client -> fail closed.
-  * client SASL passthrough directly into `SaslInitiation` -> reject.
-  * `SaslInitiation` before `SaslTermination` -> client SASL rejected (misordered chain).
+  * `SaslTermination` SCRAM-SHA-256 client -> `SaslInitiation` PLAIN upstream, with distinct client and broker
+    identities.
+  * `SaslTermination` SCRAM-SHA-256 client -> `SaslInitiation` SCRAM-SHA-512 upstream (mechanism translation).
+  * per-user credentials and mapped usernames (`alice` -> `svc-alice`).
+  * mTLS client -> `SaslInitiation` SCRAM-SHA-512 upstream, using `KeytoolCertificateGenerator` and `@Tls`, with a
+    `clientTlsSanDnsName` subject builder.
+  * anonymous client -> fixed identity upstream.
+  * subject mode with anonymous client -> generic failure and close.
+  * client SASL directly into `SaslInitiation` with no termination -> `UNSUPPORTED_SASL_MECHANISM` and close.
+  * `SaslInitiation` before `SaslTermination` -> the same rejection, documented as a misconfiguration.
+* A small code fix for the composition case where a Kafka client sends a second `ApiVersions` request after client
+  SASL termination. Only the first client `ApiVersions` exchange is forwarded before initiation; later ones trigger
+  upstream authentication and are forwarded afterwards, otherwise the broker rejects them as unexpected during its
+  SASL handshake state.
 * Documentation of the required chain order and the `SaslTermination` mechanism limitation.
-* Any small code fixes revealed by these tests.
 
 **Tests**
 
 * Real Kafka for every scenario above.
-* Assert record headers or a test filter sees the correct downstream subject; `SaslInitiation` must not change it.
-* Assert broker sees the configured upstream identity (e.g. via ACLs or a test filter/observer).
-* Assert client-visible failures are generic and connections close.
+* Assert the downstream subject seen by the later observer is unchanged by `SaslInitiation`.
+* Assert the observer parses the configured upstream mechanism and authorization id from the initiator's own frames.
+* Assert client-visible failures are generic and connections close; handshake rejection exposes no broker mechanism
+  list or error text.
+
+**Mechanism limitation:** released `SaslTermination` 0.26.0 supports SCRAM and OAUTHBEARER, not PLAIN. The composition
+tests therefore use SCRAM client termination. No PLAIN-termination claim is made; covering it would require a clearly
+marked test-only terminator or an upstream `SaslTermination` change.
 
 **Prompt**
 
@@ -1461,6 +1478,14 @@ per-target credentials and independent authentication state.
   that the route-level filter is the supported configuration.
 * Documentation updates for leaf-route placement.
 * Any small logging/clarity fixes.
+
+**Implementation notes**
+
+* The routing IT uses two real Kafka clusters, not two routes to the same cluster. The runtime caches upstream
+  connections by target address, so two routes to the same broker address share one connection; independent per-route
+  credentials require distinct upstream targets.
+* Routing is gated by `Feature.ROUTING` in the test harness.
+* The leaf-route configuration example lives in `plan/sasl-initiation.md` §6.1 and the README.
 
 **Prompt**
 
@@ -1855,7 +1880,8 @@ with the example config; the full test matrix is green.
 8. **Client SASL errors.** `UNSUPPORTED_SASL_MECHANISM` for client handshake; `ILLEGAL_SASL_STATE` for client
    authenticate. Upstream failures always use `UNKNOWN_SERVER_ERROR`.
 9. **SaslTermination PLAIN.** Released `SaslTermination` supports SCRAM/OAUTH, not PLAIN. The composition matrix tests
-   released behaviour; a PLAIN client terminator would require a test-only filter or an upstream change.
+   released SCRAM termination only and does not add a test-only PLAIN terminator. Covering PLAIN termination would
+   require such a filter or an upstream change.
 10. **System test architecture.** Use a Testcontainers Kafka plus a real Kroxylicious distribution subprocess, rather
     than Strimzi/Kubernetes. This tests packaging, plugin discovery, config, CLI and networking without requiring a
     cluster. Add a Kubernetes/Operator system test later if the filter is upstreamed.
@@ -1872,9 +1898,13 @@ with the example config; the full test matrix is green.
   Expected-subject mapping is deployment-defined; token exchange remains out of scope.
 * **KeyStore plaintext in memory.** The proxy must hold plaintext credentials/tokens in memory. Document the residual
   risk; the destroyable-secret wrapper only reduces avoidable copies.
-* **Pipelined frames during auth.** The filter relies on runtime backpressure. The pipelining ITs must verify that
-  already-decoded frames remain bounded; if not, fix the runtime's deferred-stage handling rather than adding a filter
-  queue.
+* **Pipelined frames during auth.** The filter relies on runtime backpressure and keeps no request queue.
+  Commit 12's `SaslInitiationPipeliningIT` pipelines 400 metadata requests while a delayed `SaslAuthenticate` keeps the
+  deferred stage open. It confirms that only the in-flight request is dispatched, no business request reaches the broker
+  before authentication or reauthentication completes, and requests are forwarded in order after release. The runtime
+  still decodes frames already present in the Netty read buffer and chains them in `FilterHandler.readFuture`; that
+  memory is bounded by the read/socket buffer and the deferred-stage timeout, not by request count. Revisit if a runtime
+  read-batch or byte limit is introduced; do not add a filter-level queue.
 * **Kafka API versions.** The filter requires handshake v1+ and authenticate v1+ (for session lifetime). Kafka 4.0+ is
   the supported floor. Test the floor in the nightly compatibility job.
 * **Secret leakage via errors.** Only log sanitized broker error codes/messages; never forward broker error text.
@@ -1891,6 +1921,23 @@ with the example config; the full test matrix is green.
   errors.
 * Kubernetes Operator/Secret templating integration and a Strimzi-based system test.
 * Performance benchmarks for post-auth interception and reauth storms.
+
+### 8.4 Documentation reconciliation
+
+Writing the first-release documentation (Commit 15) exposed the following differences between the plan text and the
+implemented behaviour. The documentation follows the implementation; the plan entries are retained as the historical
+design intent.
+
+1. **`identity.key` in fixed-identity OAUTHBEARER with a token file.** §8.1 item 4 says the key is optional in this mode
+   and suggests an internal key `fixed`. The implementation requires a non-blank `identity.key` in every fixed mode,
+   including a fixed `file:` token, and uses the configured key as the identity lookup/cache key. The configuration
+   reference documents the key as required.
+2. **`keyStore` in fixed-identity OAUTHBEARER with a token file.** §6.5 describes the KeyStore as optional in this mode.
+   The implementation rejects a configured `keyStore` because there is no KeyStore entry to use: the token file is
+   trusted and not subject-mapped. The configuration reference documents the KeyStore as forbidden (must be omitted).
+3. **Token-retrieval metric tags.** D26 recommends token-retrieval duration/outcome alongside the main authentication
+   metrics but does not fix tags. The implementation records `kroxylicious_filter_sasl_initiation_token_retrieval_duration_seconds`
+   with only the bounded `outcome` tag; the documentation states this explicitly.
 
 ---
 
@@ -1909,7 +1956,7 @@ with the example config; the full test matrix is green.
 | 7 | Pipelining during auth (stage incomplete, no buffer) | protocol | 5 |
 | 8 | SCRAM-256/512 fixed identity | protocol + IT | 6 |
 | 9 | Subject mode + mapped username + fail closed | protocol + IT | 7 |
-| 10 | Subject change after auth | protocol | 7 |
+| 10 | Subject change after auth (generic error + close; fixed mode unaffected) | protocol + IT | 7, 12 |
 | 11 | SaslTermination SCRAM -> upstream PLAIN/SCRAM | IT | 8 |
 | 12 | mTLS -> upstream SCRAM | IT | 8 |
 | 13 | Chain order/misorder + passthrough rejection | IT | 8 |
@@ -1918,7 +1965,7 @@ with the example config; the full test matrix is green.
 | 16 | OAuth subject mode + expected subject | IT | 10 |
 | 17 | Reauth deadline/jitter/fresh client/subject guard | unit/protocol | 11 |
 | 18 | Reauth against real Kafka with short lifetime | IT | 12 |
-| 19 | Pipelining/backpressure during reauth | IT | 12 |
+| 19 | Pipelining/backpressure during auth and reauth | protocol + IT | 5, 12 |
 | 20 | Routing per-leaf-route credentials | IT | 13 |
 | 21 | Metrics/log redaction | unit + IT | 14 |
 | 22 | Docs/examples validated | unit/docs | 15 |

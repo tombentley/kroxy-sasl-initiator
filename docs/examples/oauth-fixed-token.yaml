@@ -1,0 +1,40 @@
+#
+# Copyright Kroxylicious Authors.
+#
+# Licensed under the Apache Software License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
+#
+
+# Fixed identity using an operator-controlled OAuth bearer token file.
+# The token file is trusted and is not subject-mapped. No KeyStore is used.
+filterDefinitions:
+  - name: sasl-initiation
+    type: SaslInitiation
+    config:
+      mechanism: OAUTHBEARER
+      identity:
+        mode: fixed
+        key: proxy-service
+      oauthBearer:
+        tokenEndpointUrl: file:/etc/kroxylicious/proxy-service.jwt
+        scope: kafka
+        subjectClaimName: sub
+
+clusterDefinitions:
+  - name: kafka
+    bootstrapServers: kafka.example.com:9093
+    tls:
+      trust:
+        storeFile: /etc/kroxylicious/kafka.truststore.p12
+        storePassword:
+          passwordFile: /etc/kroxylicious/kafka.truststore.password
+
+virtualClusters:
+  - name: demo
+    target:
+      cluster: kafka
+    filters:
+      - sasl-initiation
+    gateways:
+      - name: default
+        portIdentifiesNode:
+          bootstrapAddress: localhost:9192

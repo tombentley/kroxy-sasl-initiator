@@ -6,10 +6,15 @@
 
 package com.github.tombentley.kroxylicious.filter.sasl.initiation;
 
+import java.io.IOException;
+import java.security.NoSuchAlgorithmException;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Deque;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
@@ -17,12 +22,26 @@ import java.util.concurrent.CompletionStage;
 import javax.security.auth.callback.Callback;
 import javax.security.auth.callback.CallbackHandler;
 import javax.security.auth.callback.NameCallback;
+import javax.security.auth.callback.UnsupportedCallbackException;
+import javax.security.auth.login.AppConfigurationEntry;
 import javax.security.sasl.SaslException;
 import javax.security.sasl.SaslServer;
 
+import org.apache.kafka.common.security.auth.AuthenticateCallbackHandler;
+import org.apache.kafka.common.security.oauthbearer.OAuthBearerExtensionsValidatorCallback;
+import org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule;
+import org.apache.kafka.common.security.oauthbearer.OAuthBearerToken;
+import org.apache.kafka.common.security.oauthbearer.OAuthBearerValidatorCallback;
+import org.apache.kafka.common.security.oauthbearer.internals.OAuthBearerSaslServer;
 import org.apache.kafka.common.security.plain.PlainAuthenticateCallback;
 import org.apache.kafka.common.security.plain.internals.PlainSaslServer;
 import org.apache.kafka.common.security.plain.internals.PlainSaslServerProvider;
+import org.apache.kafka.common.security.scram.ScramCredential;
+import org.apache.kafka.common.security.scram.ScramCredentialCallback;
+import org.apache.kafka.common.security.scram.internals.ScramFormatter;
+import org.apache.kafka.common.security.scram.internals.ScramMechanism;
+import org.apache.kafka.common.security.scram.internals.ScramSaslServer;
+import org.apache.kafka.common.security.scram.internals.ScramSaslServerProvider;
 
 import io.kroxylicious.kafka.common.message.ApiVersionsRequestData;
 import io.kroxylicious.kafka.common.message.ApiVersionsResponseData;
@@ -42,11 +61,17 @@ import static com.github.tombentley.kroxylicious.filter.sasl.initiation.TestStor
 
 /**
  * A small fake broker for protocol tests. It answers ApiVersions, SaslHandshake and SaslAuthenticate, using Kafka's
- * {@link PlainSaslServer} for the actual PLAIN challenge/response.
+ * {@link PlainSaslServer} or {@link ScramSaslServer} for the actual challenge/response.
  */
 final class FakeSaslBroker implements MockFilterContext.SendRequestHandler {
 
     static final String BROKER_USERNAME = "broker-alice";
+    private static final int SCRAM_ITERATIONS = 4096;
+
+    static {
+        PlainSaslServerProvider.initialize();
+        ScramSaslServerProvider.initialize();
+    }
 
     private String username = BROKER_USERNAME;
     private String password = BROKER_PASSWORD;
@@ -55,10 +80,14 @@ final class FakeSaslBroker implements MockFilterContext.SendRequestHandler {
     private short authenticateMaxVersion = ApiKeys.SASL_AUTHENTICATE.latestVersion();
     private boolean includeSaslApiVersions = true;
     private long sessionLifetimeMs;
+    private final Deque<Long> sessionLifetimes = new ArrayDeque<>();
     private boolean unexpectedTokenAfterCompletion;
+    private @Nullable OAuthBearerToken oauthBearerToken;
     private @Nullable RuntimeException sendRequestFailure;
     private @Nullable CompletableFuture<ApiMessage> pendingHandshake;
     private @Nullable String pendingHandshakeMechanism;
+    private int pendingHandshakeOn = -1;
+    private int handshakeCount;
 
     private final List<CapturedRequest> capturedRequests = new ArrayList<>();
     private @Nullable SaslServer saslServer;
@@ -67,7 +96,7 @@ final class FakeSaslBroker implements MockFilterContext.SendRequestHandler {
      * Creates a fake broker that accepts the default test credential and PLAIN.
      */
     FakeSaslBroker() {
-        PlainSaslServerProvider.initialize();
+        // Providers are registered once by the static initializer above.
     }
 
     FakeSaslBroker withCredentials(String username, String password) {
@@ -79,6 +108,7 @@ final class FakeSaslBroker implements MockFilterContext.SendRequestHandler {
 
     FakeSaslBroker withEnabledMechanisms(String... mechanisms) {
         this.enabledMechanisms = new LinkedHashSet<>(Arrays.asList(mechanisms));
+        this.saslServer = null;
         return this;
     }
 
@@ -93,8 +123,27 @@ final class FakeSaslBroker implements MockFilterContext.SendRequestHandler {
         return this;
     }
 
+    FakeSaslBroker withOAuthBearerToken(OAuthBearerToken token) {
+        this.oauthBearerToken = token;
+        this.saslServer = null;
+        return this;
+    }
+
     FakeSaslBroker withSessionLifetimeMs(long sessionLifetimeMs) {
         this.sessionLifetimeMs = sessionLifetimeMs;
+        return this;
+    }
+
+    /**
+     * Supplies one session lifetime per successful authenticate response, falling back to the configured fixed value
+     * once the sequence is exhausted. Useful for testing that reauthentication reschedules from a new lifetime.
+     *
+     * @param sessionLifetimes the lifetimes, in response order
+     * @return this broker
+     */
+    FakeSaslBroker withSessionLifetimeSequence(long... sessionLifetimes) {
+        this.sessionLifetimes.clear();
+        Arrays.stream(sessionLifetimes).boxed().forEach(this.sessionLifetimes::add);
         return this;
     }
 
@@ -109,7 +158,17 @@ final class FakeSaslBroker implements MockFilterContext.SendRequestHandler {
     }
 
     FakeSaslBroker withPendingHandshake() {
-        this.pendingHandshake = new CompletableFuture<>();
+        return withPendingHandshakeOn(1);
+    }
+
+    /**
+     * Makes the handshake with the given one-based ordinal wait until {@link #completePendingHandshake()} is called.
+     *
+     * @param handshakeOrdinal the one-based handshake ordinal
+     * @return this broker
+     */
+    FakeSaslBroker withPendingHandshakeOn(int handshakeOrdinal) {
+        this.pendingHandshakeOn = handshakeOrdinal;
         return this;
     }
 
@@ -138,6 +197,10 @@ final class FakeSaslBroker implements MockFilterContext.SendRequestHandler {
             return CompletableFuture.completedFuture(configuredApiVersionsResponse());
         }
         if (request instanceof SaslHandshakeRequestData handshake) {
+            handshakeCount++;
+            if (pendingHandshakeOn == handshakeCount) {
+                pendingHandshake = new CompletableFuture<>();
+            }
             if (pendingHandshake != null) {
                 pendingHandshakeMechanism = handshake.mechanism();
                 return pendingHandshake;
@@ -152,13 +215,34 @@ final class FakeSaslBroker implements MockFilterContext.SendRequestHandler {
 
     private SaslHandshakeResponseData handshakeResponse(@Nullable String requestedMechanism) {
         if (requestedMechanism == null || !enabledMechanisms.contains(requestedMechanism)) {
-            return new SaslHandshakeResponseData()
-                    .setErrorCode(Errors.UNSUPPORTED_SASL_MECHANISM.code())
-                    .setMechanisms(new ArrayList<>(enabledMechanisms));
+            return handshakeError();
         }
-        saslServer = new PlainSaslServer(callbackHandler());
+        if (PlainSaslServer.PLAIN_MECHANISM.equals(requestedMechanism)) {
+            saslServer = new PlainSaslServer(plainCallbackHandler());
+        }
+        else if (ScramMechanism.isScram(requestedMechanism)) {
+            try {
+                ScramMechanism scramMechanism = ScramMechanism.forMechanismName(requestedMechanism);
+                saslServer = new ScramSaslServer(scramMechanism, Map.of(), scramCallbackHandler(scramMechanism));
+            }
+            catch (NoSuchAlgorithmException e) {
+                throw new IllegalStateException("Could not create the fake SCRAM server", e);
+            }
+        }
+        else if (OAuthBearerLoginModule.OAUTHBEARER_MECHANISM.equals(requestedMechanism) && oauthBearerToken != null) {
+            saslServer = new OAuthBearerSaslServer(oauthCallbackHandler(oauthBearerToken));
+        }
+        else {
+            return handshakeError();
+        }
         return new SaslHandshakeResponseData()
                 .setErrorCode(Errors.NONE.code())
+                .setMechanisms(new ArrayList<>(enabledMechanisms));
+    }
+
+    private SaslHandshakeResponseData handshakeError() {
+        return new SaslHandshakeResponseData()
+                .setErrorCode(Errors.UNSUPPORTED_SASL_MECHANISM.code())
                 .setMechanisms(new ArrayList<>(enabledMechanisms));
     }
 
@@ -180,7 +264,7 @@ final class FakeSaslBroker implements MockFilterContext.SendRequestHandler {
             return new SaslAuthenticateResponseData()
                     .setErrorCode(Errors.NONE.code())
                     .setAuthBytes(responseAuthBytes)
-                    .setSessionLifetimeMs(sessionLifetimeMs);
+                    .setSessionLifetimeMs(nextSessionLifetimeMs());
         }
         catch (SaslException e) {
             return new SaslAuthenticateResponseData()
@@ -190,7 +274,12 @@ final class FakeSaslBroker implements MockFilterContext.SendRequestHandler {
         }
     }
 
-    private CallbackHandler callbackHandler() {
+    private long nextSessionLifetimeMs() {
+        Long next = sessionLifetimes.pollFirst();
+        return next == null ? sessionLifetimeMs : next;
+    }
+
+    private CallbackHandler plainCallbackHandler() {
         return callbacks -> {
             String presentedUsername = null;
             PlainAuthenticateCallback authenticateCallback = null;
@@ -206,6 +295,61 @@ final class FakeSaslBroker implements MockFilterContext.SendRequestHandler {
                 boolean authenticated = username.equals(presentedUsername)
                         && Arrays.equals(password.toCharArray(), authenticateCallback.password());
                 authenticateCallback.authenticated(authenticated);
+            }
+        };
+    }
+
+    private CallbackHandler scramCallbackHandler(ScramMechanism mechanism) throws NoSuchAlgorithmException {
+        ScramCredential expectedCredential = new ScramFormatter(mechanism)
+                .generateCredential(password, SCRAM_ITERATIONS);
+        return callbacks -> {
+            String presentedUsername = null;
+            ScramCredentialCallback credentialCallback = null;
+            for (Callback callback : callbacks) {
+                if (callback instanceof NameCallback nameCallback) {
+                    String name = nameCallback.getName();
+                    presentedUsername = name == null ? nameCallback.getDefaultName() : name;
+                }
+                else if (callback instanceof ScramCredentialCallback scramCredentialCallback) {
+                    credentialCallback = scramCredentialCallback;
+                }
+            }
+            if (credentialCallback != null) {
+                credentialCallback.scramCredential(username.equals(presentedUsername) ? expectedCredential : null);
+            }
+        };
+    }
+
+    private static AuthenticateCallbackHandler oauthCallbackHandler(OAuthBearerToken expectedToken) {
+        return new AuthenticateCallbackHandler() {
+            @Override
+            public void configure(Map<String, ?> configs, String saslMechanism, List<AppConfigurationEntry> jaasConfigEntries) {
+                // Nothing to configure.
+            }
+
+            @Override
+            public void handle(Callback[] callbacks) throws IOException, UnsupportedCallbackException {
+                for (Callback callback : callbacks) {
+                    if (callback instanceof OAuthBearerValidatorCallback validatorCallback) {
+                        if (expectedToken.value().equals(validatorCallback.tokenValue())) {
+                            validatorCallback.token(expectedToken);
+                        }
+                        else {
+                            validatorCallback.error("invalid_token", null, null);
+                        }
+                    }
+                    else if (callback instanceof OAuthBearerExtensionsValidatorCallback) {
+                        // Accept no extensions.
+                    }
+                    else {
+                        throw new UnsupportedCallbackException(callback, "Unsupported fake OAuth callback");
+                    }
+                }
+            }
+
+            @Override
+            public void close() {
+                // Nothing to close.
             }
         };
     }

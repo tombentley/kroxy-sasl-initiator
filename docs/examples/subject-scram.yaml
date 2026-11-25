@@ -1,0 +1,53 @@
+#
+# Copyright Kroxylicious Authors.
+#
+# Licensed under the Apache Software License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
+#
+
+# Per-client identity: SaslTermination authenticates the client with SCRAM, then
+# SaslInitiation maps the terminated user to a broker SCRAM credential.
+filterDefinitions:
+  - name: sasl-termination
+    type: SaslTermination
+    config:
+      mechanisms:
+        - mechanism: SCRAM-SHA-256
+          credentialStore: io.kroxylicious.scram.credentialstore.file.ScramCredentialFileService
+          credentialStoreConfig:
+            file: /etc/kroxylicious/termination-credentials.p12
+            filePassword:
+              passwordFile: /etc/kroxylicious/termination-credentials.p12.password
+
+  - name: sasl-initiation
+    type: SaslInitiation
+    config:
+      mechanism: SCRAM-SHA-512
+      identity:
+        mode: subject
+        principalType: io.kroxylicious.proxy.authentication.User
+      keyStore:
+        file: /etc/kroxylicious/sasl-initiation.p12
+        filePassword:
+          passwordFile: /etc/kroxylicious/sasl-initiation.p12.password
+
+clusterDefinitions:
+  - name: kafka
+    bootstrapServers: kafka.example.com:9093
+    tls:
+      trust:
+        storeFile: /etc/kroxylicious/kafka.truststore.p12
+        storePassword:
+          passwordFile: /etc/kroxylicious/kafka.truststore.password
+
+virtualClusters:
+  - name: demo
+    target:
+      cluster: kafka
+    # Client-facing authentication first; initiator last/closest to the broker.
+    filters:
+      - sasl-termination
+      - sasl-initiation
+    gateways:
+      - name: default
+        portIdentifiesNode:
+          bootstrapAddress: localhost:9192

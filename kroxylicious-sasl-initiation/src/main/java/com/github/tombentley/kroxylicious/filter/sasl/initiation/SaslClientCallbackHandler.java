@@ -10,6 +10,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 
 import javax.security.auth.callback.Callback;
 import javax.security.auth.callback.CallbackHandler;
@@ -17,10 +18,12 @@ import javax.security.auth.callback.NameCallback;
 import javax.security.auth.callback.PasswordCallback;
 import javax.security.auth.callback.UnsupportedCallbackException;
 
+import org.apache.kafka.common.security.scram.ScramExtensionsCallback;
+
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.credentials.PasswordCredential;
 
 /**
- * Supplies the broker username and password to the SASL client for password-based mechanisms.
+ * Supplies the broker username, password and SCRAM extensions to the SASL client for password-based mechanisms.
  * <p>
  * Password arrays handed to the SASL client are kept only for the lifetime of one exchange and zeroized by
  * {@link #close()}. The credential itself is also destroyed by the owning exchange.
@@ -50,6 +53,11 @@ final class SaslClientCallbackHandler implements CallbackHandler, AutoCloseable 
                 char[] password = credential.password().chars();
                 passwordCopies.add(password);
                 passwordCallback.setPassword(password);
+            }
+            else if (callback instanceof ScramExtensionsCallback scramExtensionsCallback) {
+                // This filter does not use SCRAM extensions, so authenticate without any. Kafka's SCRAM client
+                // requires a non-null map when the callback is handled.
+                scramExtensionsCallback.extensions(Map.of());
             }
             else {
                 throw new UnsupportedCallbackException(callback,
