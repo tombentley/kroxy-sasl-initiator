@@ -297,6 +297,11 @@ class OAuthTokenServiceTest {
                     .containsEntry(SaslConfigs.SASL_OAUTHBEARER_TOKEN_ENDPOINT_URL, "https://idp.example.com/token")
                     .containsEntry(SaslConfigs.SASL_OAUTHBEARER_SCOPE, "kafka")
                     .containsEntry(SaslConfigs.SASL_OAUTHBEARER_SUB_CLAIM_NAME, "preferred_username")
+                    // HttpJwtRetriever requires these, and would otherwise fail to configure.
+                    .containsEntry(SaslConfigs.SASL_LOGIN_RETRY_BACKOFF_MS,
+                            SaslConfigs.DEFAULT_SASL_LOGIN_RETRY_BACKOFF_MS)
+                    .containsEntry(SaslConfigs.SASL_LOGIN_RETRY_BACKOFF_MAX_MS,
+                            SaslConfigs.DEFAULT_SASL_LOGIN_RETRY_BACKOFF_MAX_MS)
                     .containsEntry(SaslConfigs.SASL_OAUTHBEARER_CLIENT_CREDENTIALS_CLIENT_ID, CLIENT_ID)
                     .containsEntry(SaslConfigs.SASL_OAUTHBEARER_CLIENT_CREDENTIALS_CLIENT_SECRET,
                             new Password(CLIENT_SECRET));

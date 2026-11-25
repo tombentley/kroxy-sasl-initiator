@@ -231,6 +231,12 @@ public final class OAuthTokenService implements AutoCloseable {
         // Kafka's ClientJwtValidator requires the scope claim name to be present even when using the default.
         configs.put(SaslConfigs.SASL_OAUTHBEARER_SCOPE_CLAIM_NAME,
                 SaslConfigs.DEFAULT_SASL_OAUTHBEARER_SCOPE_CLAIM_NAME);
+        // Kafka's HttpJwtRetriever requires these login retry settings. They normally come from KafkaConfig
+        // defaults, but the retriever is configured from this bare map rather than a KafkaConfig.
+        configs.put(SaslConfigs.SASL_LOGIN_RETRY_BACKOFF_MS,
+                SaslConfigs.DEFAULT_SASL_LOGIN_RETRY_BACKOFF_MS);
+        configs.put(SaslConfigs.SASL_LOGIN_RETRY_BACKOFF_MAX_MS,
+                SaslConfigs.DEFAULT_SASL_LOGIN_RETRY_BACKOFF_MAX_MS);
         if (oauthBearerConfig.scope() != null) {
             configs.put(SaslConfigs.SASL_OAUTHBEARER_SCOPE, oauthBearerConfig.scope());
         }
