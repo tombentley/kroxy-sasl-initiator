@@ -10,9 +10,12 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletionStage;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.it.CompositionObserverFilter.Config;
 
@@ -65,6 +68,8 @@ public class CompositionObserverFilter implements FilterFactory<Config, Config> 
     public static final String UPSTREAM_MECHANISM_HEADER = "x-composition-upstream-mechanism";
     /** Header containing the authorization id used on the upstream connection. */
     public static final String UPSTREAM_AUTHORIZATION_ID_HEADER = "x-composition-upstream-authorization-id";
+    /** Header containing the OAuth token subject used on the upstream connection. */
+    public static final String UPSTREAM_OAUTH_SUBJECT_HEADER = "x-composition-upstream-oauth-subject";
 
     /**
      * Empty configuration for the test observer.
@@ -104,6 +109,7 @@ public class CompositionObserverFilter implements FilterFactory<Config, Config> 
 
         private String upstreamMechanism = "";
         private String upstreamAuthorizationId = "";
+        private String upstreamOauthSubject = "";
 
         @Override
         public CompletionStage<RequestFilterResult> onRequest(ApiKeys apiKey,
@@ -114,10 +120,16 @@ public class CompositionObserverFilter implements FilterFactory<Config, Config> 
             switch (apiKey) {
                 case SASL_HANDSHAKE -> upstreamMechanism = ((SaslHandshakeRequestData) request).mechanism();
                 case SASL_AUTHENTICATE -> {
-                    String parsedAuthorizationId = authorizationId(upstreamMechanism,
-                            ((SaslAuthenticateRequestData) request).authBytes());
+                    byte[] authBytes = ((SaslAuthenticateRequestData) request).authBytes();
+                    String parsedAuthorizationId = authorizationId(upstreamMechanism, authBytes);
                     if (!parsedAuthorizationId.isEmpty()) {
                         upstreamAuthorizationId = parsedAuthorizationId;
+                    }
+                    if ("OAUTHBEARER".equals(upstreamMechanism)) {
+                        String parsedOauthSubject = oauthSubject(authBytes);
+                        if (!parsedOauthSubject.isEmpty()) {
+                            upstreamOauthSubject = parsedOauthSubject;
+                        }
                     }
                 }
                 case PRODUCE -> injectHeaders((ProduceRequestData) request, context);
@@ -133,7 +145,8 @@ public class CompositionObserverFilter implements FilterFactory<Config, Config> 
                     new RecordHeader(DOWNSTREAM_SUBJECT_HEADER,
                             context.authenticatedSubject().toString().getBytes(StandardCharsets.UTF_8)),
                     new RecordHeader(UPSTREAM_MECHANISM_HEADER, upstreamMechanism.getBytes(StandardCharsets.UTF_8)),
-                    new RecordHeader(UPSTREAM_AUTHORIZATION_ID_HEADER, upstreamAuthorizationId.getBytes(StandardCharsets.UTF_8)));
+                    new RecordHeader(UPSTREAM_AUTHORIZATION_ID_HEADER, upstreamAuthorizationId.getBytes(StandardCharsets.UTF_8)),
+                    new RecordHeader(UPSTREAM_OAUTH_SUBJECT_HEADER, upstreamOauthSubject.getBytes(StandardCharsets.UTF_8)));
 
             for (ProduceRequestData.TopicProduceData topicDatum : request.topicData()) {
                 for (ProduceRequestData.PartitionProduceData partitionDatum : topicDatum.partitionData()) {
@@ -207,6 +220,33 @@ public class CompositionObserverFilter implements FilterFactory<Config, Config> 
 
         private static String decodeSaslName(String value) {
             return value.replace("=2C", ",").replace("=3D", "=");
+        }
+
+        private static String oauthSubject(byte[] authBytes) {
+            if (authBytes == null || authBytes.length == 0) {
+                return "";
+            }
+            String message = new String(authBytes, StandardCharsets.UTF_8);
+            String marker = "auth=Bearer ";
+            int markerStart = message.indexOf(marker);
+            if (markerStart < 0) {
+                return "";
+            }
+            int tokenStart = markerStart + marker.length();
+            int tokenEnd = message.indexOf('\u0001', tokenStart);
+            String token = tokenEnd < 0 ? message.substring(tokenStart) : message.substring(tokenStart, tokenEnd);
+            String[] parts = token.split("\\.", -1);
+            if (parts.length < 2) {
+                return "";
+            }
+            try {
+                String payload = new String(Base64.getUrlDecoder().decode(parts[1]), StandardCharsets.UTF_8);
+                Matcher matcher = Pattern.compile("\"sub\"\\s*:\\s*\"([^\"]*)\"").matcher(payload);
+                return matcher.find() ? matcher.group(1) : "";
+            }
+            catch (IllegalArgumentException e) {
+                return "";
+            }
         }
     }
 }
