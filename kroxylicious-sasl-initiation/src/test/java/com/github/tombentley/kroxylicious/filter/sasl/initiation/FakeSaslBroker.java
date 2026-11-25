@@ -8,8 +8,10 @@ package com.github.tombentley.kroxylicious.filter.sasl.initiation;
 
 import java.io.IOException;
 import java.security.NoSuchAlgorithmException;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Deque;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -78,11 +80,14 @@ final class FakeSaslBroker implements MockFilterContext.SendRequestHandler {
     private short authenticateMaxVersion = ApiKeys.SASL_AUTHENTICATE.latestVersion();
     private boolean includeSaslApiVersions = true;
     private long sessionLifetimeMs;
+    private final Deque<Long> sessionLifetimes = new ArrayDeque<>();
     private boolean unexpectedTokenAfterCompletion;
     private @Nullable OAuthBearerToken oauthBearerToken;
     private @Nullable RuntimeException sendRequestFailure;
     private @Nullable CompletableFuture<ApiMessage> pendingHandshake;
     private @Nullable String pendingHandshakeMechanism;
+    private int pendingHandshakeOn = -1;
+    private int handshakeCount;
 
     private final List<CapturedRequest> capturedRequests = new ArrayList<>();
     private @Nullable SaslServer saslServer;
@@ -129,6 +134,19 @@ final class FakeSaslBroker implements MockFilterContext.SendRequestHandler {
         return this;
     }
 
+    /**
+     * Supplies one session lifetime per successful authenticate response, falling back to the configured fixed value
+     * once the sequence is exhausted. Useful for testing that reauthentication reschedules from a new lifetime.
+     *
+     * @param sessionLifetimes the lifetimes, in response order
+     * @return this broker
+     */
+    FakeSaslBroker withSessionLifetimeSequence(long... sessionLifetimes) {
+        this.sessionLifetimes.clear();
+        Arrays.stream(sessionLifetimes).boxed().forEach(this.sessionLifetimes::add);
+        return this;
+    }
+
     FakeSaslBroker withUnexpectedTokenAfterCompletion() {
         this.unexpectedTokenAfterCompletion = true;
         return this;
@@ -140,7 +158,17 @@ final class FakeSaslBroker implements MockFilterContext.SendRequestHandler {
     }
 
     FakeSaslBroker withPendingHandshake() {
-        this.pendingHandshake = new CompletableFuture<>();
+        return withPendingHandshakeOn(1);
+    }
+
+    /**
+     * Makes the handshake with the given one-based ordinal wait until {@link #completePendingHandshake()} is called.
+     *
+     * @param handshakeOrdinal the one-based handshake ordinal
+     * @return this broker
+     */
+    FakeSaslBroker withPendingHandshakeOn(int handshakeOrdinal) {
+        this.pendingHandshakeOn = handshakeOrdinal;
         return this;
     }
 
@@ -169,6 +197,10 @@ final class FakeSaslBroker implements MockFilterContext.SendRequestHandler {
             return CompletableFuture.completedFuture(configuredApiVersionsResponse());
         }
         if (request instanceof SaslHandshakeRequestData handshake) {
+            handshakeCount++;
+            if (pendingHandshakeOn == handshakeCount) {
+                pendingHandshake = new CompletableFuture<>();
+            }
             if (pendingHandshake != null) {
                 pendingHandshakeMechanism = handshake.mechanism();
                 return pendingHandshake;
@@ -232,7 +264,7 @@ final class FakeSaslBroker implements MockFilterContext.SendRequestHandler {
             return new SaslAuthenticateResponseData()
                     .setErrorCode(Errors.NONE.code())
                     .setAuthBytes(responseAuthBytes)
-                    .setSessionLifetimeMs(sessionLifetimeMs);
+                    .setSessionLifetimeMs(nextSessionLifetimeMs());
         }
         catch (SaslException e) {
             return new SaslAuthenticateResponseData()
@@ -240,6 +272,11 @@ final class FakeSaslBroker implements MockFilterContext.SendRequestHandler {
                     .setErrorMessage("broker-only diagnostic text")
                     .setAuthBytes(new byte[0]);
         }
+    }
+
+    private long nextSessionLifetimeMs() {
+        Long next = sessionLifetimes.pollFirst();
+        return next == null ? sessionLifetimeMs : next;
     }
 
     private CallbackHandler plainCallbackHandler() {

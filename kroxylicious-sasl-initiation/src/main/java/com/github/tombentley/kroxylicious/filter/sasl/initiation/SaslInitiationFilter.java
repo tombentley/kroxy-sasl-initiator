@@ -6,6 +6,7 @@
 
 package com.github.tombentley.kroxylicious.filter.sasl.initiation;
 
+import java.time.Clock;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
@@ -55,8 +56,13 @@ import edu.umd.cs.findbugs.annotations.Nullable;
  * <p>
  * The filter forwards the client's ApiVersions exchange unchanged so that clients which terminate SASL at the proxy can
  * complete their own negotiation. It initiates upstream authentication on the first non-ApiVersions request and then
- * forwards that request. Later requests are intercepted as well so subject changes and reauthentication can be observed,
- * but this commit only implements initial authentication.
+ * forwards that request. Later requests are intercepted as well so subject changes and reauthentication can be observed.
+ * </p>
+ * <p>
+ * KIP-368 reauthentication is proactive and lazy at the request boundary: a one-shot task on the connection's
+ * filter-dispatch executor marks reauthentication due at a jittered fraction of the effective session lifetime, and the
+ * next request performs the exchange before it is forwarded. Reauthentication never changes identity and never sends
+ * ApiVersions again.
  * </p>
  * <p>
  * Failure is reported to the client as a generic {@link Errors#UNKNOWN_SERVER_ERROR} followed by connection close. Broker
@@ -75,10 +81,16 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
     private final IdentityGuard identityGuard;
     private final @Nullable OAuthTokenService oauthTokenService;
     private final @Nullable FilterDispatchExecutor filterDispatchExecutor;
+    private final ReauthScheduler reauthScheduler;
+    private final Clock clock;
 
     private SaslExchangeState state = new SaslExchangeState.AwaitingTrigger();
     private boolean forwardedInitialApiVersions;
     private @Nullable SaslApiVersions cachedApiVersions;
+    private @Nullable ReauthScheduler.Deadline reauthDeadline;
+    private @Nullable ReauthScheduler.Cancellable reauthTask;
+    private boolean reauthDue;
+    private long reauthGeneration;
 
     /**
      * Creates a per-connection filter using an executor that completes work inline. Production code must use
@@ -99,11 +111,27 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
      *            OAuth
      */
     SaslInitiationFilter(SaslInitiationRuntimeConfig runtimeConfig, @Nullable FilterDispatchExecutor filterDispatchExecutor) {
+        this(runtimeConfig, filterDispatchExecutor, schedulerFor(runtimeConfig, filterDispatchExecutor));
+    }
+
+    /**
+     * Creates a per-connection filter with an explicit reauthentication scheduler. Intended for tests that need a
+     * mutable clock and a controllable task scheduler.
+     *
+     * @param runtimeConfig the shared runtime configuration
+     * @param filterDispatchExecutor the connection's filter-dispatch executor, or {@code null}
+     * @param reauthScheduler the reauthentication scheduler
+     */
+    SaslInitiationFilter(SaslInitiationRuntimeConfig runtimeConfig,
+                         @Nullable FilterDispatchExecutor filterDispatchExecutor,
+                         ReauthScheduler reauthScheduler) {
         this.config = runtimeConfig.config();
         this.credentialResolver = runtimeConfig.credentialResolver();
         this.identitySelector = runtimeConfig.identitySelector();
         this.oauthTokenService = runtimeConfig.oauthTokenService();
         this.filterDispatchExecutor = filterDispatchExecutor;
+        this.reauthScheduler = Objects.requireNonNull(reauthScheduler, "reauthScheduler");
+        this.clock = reauthScheduler.clock();
         this.identityGuard = config.identity().mode() == IdentityMode.SUBJECT
                 ? IdentityGuard.forSubject(identitySelector)
                 : IdentityGuard.disabled();
@@ -157,7 +185,11 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
                     .thenCompose(result -> result.authenticated()
                             ? forwardWithIdentityCheck(context, header, request)
                             : failureResult(context, header, request));
-            case SaslExchangeState.Authenticated ignored -> forwardWithIdentityCheck(context, header, request);
+            case SaslExchangeState.Authenticated authenticated -> handleAuthenticated(context, header, request, authenticated);
+            case SaslExchangeState.Reauthenticating reauthenticating -> reauthenticating.stage()
+                    .thenCompose(result -> result.authenticated()
+                            ? forwardWithIdentityCheck(context, header, request)
+                            : failureResult(context, header, request));
             case SaslExchangeState.Failed ignored -> failureResult(context, header, request);
         };
     }
@@ -183,6 +215,14 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
         return state;
     }
 
+    private static ReauthScheduler schedulerFor(SaslInitiationRuntimeConfig runtimeConfig,
+                                                @Nullable FilterDispatchExecutor filterDispatchExecutor) {
+        double windowFactor = runtimeConfig.config().reauth().windowFactor();
+        return filterDispatchExecutor == null
+                ? ReauthScheduler.withoutTaskScheduling(Clock.systemUTC(), windowFactor)
+                : ReauthScheduler.onFilterDispatchExecutor(filterDispatchExecutor, Clock.systemUTC(), windowFactor);
+    }
+
     private CompletionStage<RequestFilterResult> rejectClientSaslFrame(FilterContext context,
                                                                        RequestHeaderData header,
                                                                        ApiMessage request,
@@ -190,7 +230,7 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
         LOGGER.atWarn()
                 .addKeyValue("errorCode", error.code())
                 .log("Rejecting client-originated SASL frame; client SASL must be terminated before SaslInitiation");
-        state = new SaslExchangeState.Failed();
+        failClosed();
         return context.requestFilterResultBuilder()
                 .errorResponse(header, request, error)
                 .withCloseConnection()
@@ -224,9 +264,20 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
                     ? result
                     : SaslExchangeState.AuthenticationResult.failure();
             if (state == authenticating) {
-                state = outcome.authenticated()
-                        ? new SaslExchangeState.Authenticated(outcome.sessionLifetimeMs())
-                        : new SaslExchangeState.Failed();
+                if (outcome.authenticated()) {
+                    state = new SaslExchangeState.Authenticated(
+                            outcome.sessionLifetimeMs(),
+                            Objects.requireNonNull(outcome.apiVersions(), "apiVersions"),
+                            Objects.requireNonNull(outcome.identity(), "identity"),
+                            outcome.tokenExpiresAtMs());
+                    if (!armReauth(outcome, context)) {
+                        state = new SaslExchangeState.Failed();
+                        outcome = SaslExchangeState.AuthenticationResult.failure();
+                    }
+                }
+                else {
+                    state = new SaslExchangeState.Failed();
+                }
             }
             stage.complete(outcome);
         });
@@ -262,14 +313,7 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
                                                                                          IdentitySnapshot identity) {
         final PasswordCredential credential;
         try {
-            CredentialResolver.ResolvedCredential resolved = credentialResolver.resolve(
-                    identity.lookupKey(),
-                    config.mechanism().credentialKind());
-            if (!(resolved.credential() instanceof PasswordCredential passwordCredential)) {
-                throw new CredentialResolver.CredentialResolutionException(
-                        "The selected credential is not usable by the configured mechanism");
-            }
-            credential = passwordCredential;
+            credential = resolvePasswordCredential(identity.lookupKey());
         }
         catch (RuntimeException e) {
             logCredentialSelectionFailure(e);
@@ -284,11 +328,9 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
                 .addKeyValue("brokerUsername", brokerUsername)
                 .log("Selected the broker credential for SASL initiation");
 
-        CompletionStage<Long> exchange = resolveApiVersions(context)
-                .thenCompose(versions -> sendHandshake(context, versions))
-                .thenCompose(versions -> performPasswordExchange(context, credential, versions));
-
-        return completeExchange(context, identity, subject, brokerUsername, exchange);
+        return resolveApiVersions(context)
+                .thenCompose(versions -> completeExchange(context, identity, subject, brokerUsername, versions, null,
+                        performPasswordExchange(context, credential, versions)));
     }
 
     private CompletionStage<SaslExchangeState.AuthenticationResult> authenticateOAuthBearer(FilterContext context,
@@ -323,12 +365,20 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
                 ? tokenStage
                 : filterDispatchExecutor.completeOnFilterDispatchThread(tokenStage);
 
-        CompletionStage<Long> exchange = dispatchStage
-                .thenCompose(token -> resolveApiVersions(context)
-                        .thenCompose(versions -> sendHandshake(context, versions))
-                        .thenCompose(versions -> performOAuthBearerExchange(context, token, versions)));
+        return dispatchStage.thenCompose(token -> resolveApiVersions(context)
+                .thenCompose(versions -> completeExchange(context, identity, subject, tokenPrincipal, versions,
+                        token.lifetimeMs(), performOAuthBearerExchange(context, token, versions))));
+    }
 
-        return completeExchange(context, identity, subject, tokenPrincipal, exchange);
+    private PasswordCredential resolvePasswordCredential(String lookupKey) {
+        CredentialResolver.ResolvedCredential resolved = credentialResolver.resolve(
+                lookupKey,
+                config.mechanism().credentialKind());
+        if (!(resolved.credential() instanceof PasswordCredential passwordCredential)) {
+            throw new CredentialResolver.CredentialResolutionException(
+                    "The selected credential is not usable by the configured mechanism");
+        }
+        return passwordCredential;
     }
 
     private @Nullable OAuthClientCredential selectOAuthCredential(IdentitySnapshot identity) {
@@ -350,6 +400,8 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
                                                                                      IdentitySnapshot identity,
                                                                                      String subject,
                                                                                      String brokerIdentity,
+                                                                                     SaslApiVersions versions,
+                                                                                     @Nullable Long tokenExpiresAtMs,
                                                                                      CompletionStage<Long> exchange) {
         return exchange.handle((sessionLifetimeMs, error) -> {
             if (error != null) {
@@ -371,8 +423,241 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
                     .addKeyValue("brokerIdentity", brokerIdentity)
                     .log("SASL initiation authenticated the upstream connection");
             return SaslExchangeState.AuthenticationResult.success(
-                    Objects.requireNonNull(sessionLifetimeMs, "sessionLifetimeMs"));
+                    Objects.requireNonNull(sessionLifetimeMs, "sessionLifetimeMs"),
+                    versions,
+                    identity,
+                    tokenExpiresAtMs);
         });
+    }
+
+    private CompletionStage<RequestFilterResult> handleAuthenticated(FilterContext context,
+                                                                     RequestHeaderData header,
+                                                                     ApiMessage request,
+                                                                     SaslExchangeState.Authenticated authenticated) {
+        ReauthScheduler.Deadline deadline = reauthDeadline;
+        long now = clock.millis();
+        if (deadline != null && deadline.isHardDeadlineReached(now)) {
+            logReauthFailure(context, "hard-deadline", null);
+            failClosed();
+            return failureResult(context, header, request);
+        }
+        if (deadline != null && (reauthDue || deadline.isDue(now))) {
+            return startReauthentication(context, header, request, authenticated);
+        }
+        return forwardWithIdentityCheck(context, header, request);
+    }
+
+    private CompletionStage<RequestFilterResult> startReauthentication(FilterContext context,
+                                                                       RequestHeaderData header,
+                                                                       ApiMessage request,
+                                                                       SaslExchangeState.Authenticated authenticated) {
+        reauthDue = false;
+        cancelReauthTask();
+        LOGGER.atInfo()
+                .addKeyValue("mechanism", config.mechanism())
+                .addKeyValue("virtualCluster", context.getVirtualClusterName())
+                .addKeyValue("sessionId", context.sessionId())
+                .log("Starting KIP-368 SASL reauthentication");
+
+        final CompletionStage<SaslExchangeState.AuthenticationResult> exchange;
+        try {
+            exchange = reauthenticate(context, authenticated);
+        }
+        catch (RuntimeException e) {
+            logReauthFailure(context, "reauth-start", e);
+            failClosed();
+            return failureResult(context, header, request);
+        }
+
+        CompletableFuture<SaslExchangeState.AuthenticationResult> stage = new CompletableFuture<>();
+        SaslExchangeState.Reauthenticating reauthenticating = new SaslExchangeState.Reauthenticating(stage);
+        state = reauthenticating;
+        exchange.whenComplete((result, error) -> {
+            if (error != null) {
+                logExchangeFailure(error);
+            }
+            SaslExchangeState.AuthenticationResult outcome = error == null && result != null
+                    ? result
+                    : SaslExchangeState.AuthenticationResult.failure();
+            if (state == reauthenticating && outcome.authenticated()) {
+                state = new SaslExchangeState.Authenticated(
+                        outcome.sessionLifetimeMs(),
+                        Objects.requireNonNull(outcome.apiVersions(), "apiVersions"),
+                        Objects.requireNonNull(outcome.identity(), "identity"),
+                        outcome.tokenExpiresAtMs());
+                if (armReauth(outcome, context)) {
+                    logReauthSuccess(context, outcome);
+                }
+                else {
+                    state = new SaslExchangeState.Failed();
+                    outcome = SaslExchangeState.AuthenticationResult.failure();
+                }
+            }
+            else if (state == reauthenticating) {
+                state = new SaslExchangeState.Failed();
+                logReauthFailure(context, "reauth-exchange", error);
+            }
+            else {
+                outcome = SaslExchangeState.AuthenticationResult.failure();
+            }
+            stage.complete(outcome);
+        });
+
+        return stage.thenCompose(result -> result.authenticated()
+                ? forwardWithIdentityCheck(context, header, request)
+                : failureResult(context, header, request));
+    }
+
+    private CompletionStage<SaslExchangeState.AuthenticationResult> reauthenticate(FilterContext context,
+                                                                                   SaslExchangeState.Authenticated authenticated) {
+        ReauthScheduler.Deadline deadline = reauthDeadline;
+        if (deadline == null || deadline.isHardDeadlineReached(clock.millis())) {
+            logReauthFailure(context, "hard-deadline", null);
+            return CompletableFuture.completedFuture(SaslExchangeState.AuthenticationResult.failure());
+        }
+        try {
+            identityGuard.verify(context);
+        }
+        catch (RuntimeException e) {
+            logSubjectChangeFailure(e);
+            return CompletableFuture.completedFuture(SaslExchangeState.AuthenticationResult.failure());
+        }
+
+        CompletionStage<SaslExchangeState.AuthenticationResult> exchange = config.mechanism() == Mechanism.OAUTHBEARER
+                ? reauthenticateOAuthBearer(context, authenticated)
+                : reauthenticatePassword(context, authenticated);
+
+        return exchange.handle((result, error) -> {
+            if (error != null) {
+                logExchangeFailure(error);
+                return SaslExchangeState.AuthenticationResult.failure();
+            }
+            try {
+                // The subject may have changed while reauthentication was in flight. Never continue as the new
+                // identity, and never retry.
+                identityGuard.verify(context);
+            }
+            catch (RuntimeException e) {
+                logSubjectChangeFailure(e);
+                return SaslExchangeState.AuthenticationResult.failure();
+            }
+            if (deadline.isHardDeadlineReached(clock.millis())) {
+                logReauthFailure(context, "hard-deadline", null);
+                return SaslExchangeState.AuthenticationResult.failure();
+            }
+            return result == null ? SaslExchangeState.AuthenticationResult.failure() : result;
+        });
+    }
+
+    private CompletionStage<SaslExchangeState.AuthenticationResult> reauthenticatePassword(FilterContext context,
+                                                                                           SaslExchangeState.Authenticated authenticated) {
+        final PasswordCredential credential;
+        try {
+            credential = resolvePasswordCredential(authenticated.identity().lookupKey());
+        }
+        catch (RuntimeException e) {
+            logCredentialSelectionFailure(e);
+            return CompletableFuture.completedFuture(SaslExchangeState.AuthenticationResult.failure());
+        }
+
+        return performPasswordExchange(context, credential, authenticated.apiVersions())
+                .thenApply(sessionLifetimeMs -> SaslExchangeState.AuthenticationResult.success(
+                        sessionLifetimeMs,
+                        authenticated.apiVersions(),
+                        authenticated.identity(),
+                        null));
+    }
+
+    private CompletionStage<SaslExchangeState.AuthenticationResult> reauthenticateOAuthBearer(FilterContext context,
+                                                                                              SaslExchangeState.Authenticated authenticated) {
+        final OAuthTokenService tokenService = oauthTokenService;
+        if (tokenService == null) {
+            LOGGER.atWarn()
+                    .addKeyValue("mechanism", config.mechanism())
+                    .log("SASL initiation has no OAuth token service configured for reauthentication");
+            return CompletableFuture.completedFuture(SaslExchangeState.AuthenticationResult.failure());
+        }
+
+        final @Nullable OAuthClientCredential credential;
+        try {
+            credential = selectOAuthCredential(authenticated.identity());
+        }
+        catch (RuntimeException e) {
+            logCredentialSelectionFailure(e);
+            return CompletableFuture.completedFuture(SaslExchangeState.AuthenticationResult.failure());
+        }
+
+        CompletionStage<OAuthBearerToken> tokenStage = tokenService.token(authenticated.identity().lookupKey(), credential);
+        CompletionStage<OAuthBearerToken> dispatchStage = filterDispatchExecutor == null
+                ? tokenStage
+                : filterDispatchExecutor.completeOnFilterDispatchThread(tokenStage);
+
+        return dispatchStage.thenCompose(token -> performOAuthBearerExchange(context, token, authenticated.apiVersions())
+                .thenApply(sessionLifetimeMs -> SaslExchangeState.AuthenticationResult.success(
+                        sessionLifetimeMs,
+                        authenticated.apiVersions(),
+                        authenticated.identity(),
+                        token.lifetimeMs())));
+    }
+
+    private boolean armReauth(SaslExchangeState.AuthenticationResult result, FilterContext context) {
+        cancelReauthTask();
+        reauthDue = false;
+        long generation = ++reauthGeneration;
+        final Optional<ReauthScheduler.Schedule> schedule;
+        try {
+            schedule = reauthScheduler.arm(
+                    result.sessionLifetimeMs(),
+                    result.tokenExpiresAtMs(),
+                    () -> {
+                        if (generation == reauthGeneration) {
+                            reauthDue = true;
+                        }
+                    });
+        }
+        catch (RuntimeException e) {
+            logReauthFailure(context, "scheduling", e);
+            cancelReauthTask();
+            reauthDeadline = null;
+            return false;
+        }
+        if (schedule.isPresent()) {
+            ReauthScheduler.Deadline deadline = schedule.get().deadline();
+            reauthDeadline = deadline;
+            reauthTask = schedule.get().cancellation();
+            LOGGER.atDebug()
+                    .addKeyValue("mechanism", config.mechanism())
+                    .addKeyValue("virtualCluster", context.getVirtualClusterName())
+                    .addKeyValue("sessionId", context.sessionId())
+                    .addKeyValue("reauthAtMs", deadline.reauthAtMs())
+                    .addKeyValue("hardDeadlineMs", deadline.hardDeadlineMs())
+                    .log("Armed KIP-368 SASL reauthentication");
+        }
+        else {
+            reauthDeadline = null;
+            reauthTask = null;
+            LOGGER.atDebug()
+                    .addKeyValue("mechanism", config.mechanism())
+                    .addKeyValue("virtualCluster", context.getVirtualClusterName())
+                    .addKeyValue("sessionId", context.sessionId())
+                    .log("No positive SASL session lifetime; KIP-368 reauthentication will not be scheduled");
+        }
+        return true;
+    }
+
+    private void cancelReauthTask() {
+        ReauthScheduler.Cancellable task = reauthTask;
+        if (task != null) {
+            task.cancel();
+            reauthTask = null;
+        }
+    }
+
+    private void failClosed() {
+        cancelReauthTask();
+        reauthDeadline = null;
+        reauthDue = false;
+        state = new SaslExchangeState.Failed();
     }
 
     private void logCredentialSelectionFailure(RuntimeException e) {
@@ -393,7 +678,7 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
         }
         catch (RuntimeException e) {
             logSubjectChangeFailure(e);
-            state = new SaslExchangeState.Failed();
+            failClosed();
             return failureResult(context, header, request);
         }
         return context.forwardRequest(header, request);
@@ -407,6 +692,31 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
         LOGGER.atDebug()
                 .setCause(error)
                 .log("Downstream subject change detail");
+    }
+
+    private void logReauthSuccess(FilterContext context, SaslExchangeState.AuthenticationResult result) {
+        LOGGER.atInfo()
+                .addKeyValue("mechanism", config.mechanism())
+                .addKeyValue("virtualCluster", context.getVirtualClusterName())
+                .addKeyValue("sessionId", context.sessionId())
+                .addKeyValue("sessionLifetimeMs", result.sessionLifetimeMs())
+                .log("KIP-368 SASL reauthentication succeeded");
+    }
+
+    private void logReauthFailure(FilterContext context, String reason, @Nullable Throwable error) {
+        var event = LOGGER.atWarn()
+                .addKeyValue("mechanism", config.mechanism())
+                .addKeyValue("virtualCluster", context.getVirtualClusterName())
+                .addKeyValue("sessionId", context.sessionId())
+                .addKeyValue("errorCode", Errors.UNKNOWN_SERVER_ERROR.code())
+                .addKeyValue("reason", reason);
+        if (error instanceof SaslExchangeException saslExchangeException) {
+            event.addKeyValue("brokerErrorCode", saslExchangeException.brokerErrorCode());
+        }
+        if (error != null) {
+            event.addKeyValue("errorType", error.getClass().getSimpleName());
+        }
+        event.log("KIP-368 SASL reauthentication failed");
     }
 
     private CompletionStage<SaslApiVersions> resolveApiVersions(FilterContext context) {
@@ -456,6 +766,13 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
     private CompletionStage<Long> performPasswordExchange(FilterContext context,
                                                           PasswordCredential storedCredential,
                                                           SaslApiVersions versions) {
+        return sendHandshake(context, versions)
+                .thenCompose(handshakeVersions -> performPasswordClientExchange(context, storedCredential, handshakeVersions));
+    }
+
+    private CompletionStage<Long> performPasswordClientExchange(FilterContext context,
+                                                                PasswordCredential storedCredential,
+                                                                SaslApiVersions versions) {
         PasswordCredential exchangeCredential = new PasswordCredential(
                 storedCredential.username(),
                 DestroyableSecret.of(storedCredential.password().chars()));
@@ -475,6 +792,13 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
     private CompletionStage<Long> performOAuthBearerExchange(FilterContext context,
                                                              OAuthBearerToken token,
                                                              SaslApiVersions versions) {
+        return sendHandshake(context, versions)
+                .thenCompose(handshakeVersions -> performOAuthBearerClientExchange(context, token, handshakeVersions));
+    }
+
+    private CompletionStage<Long> performOAuthBearerClientExchange(FilterContext context,
+                                                                   OAuthBearerToken token,
+                                                                   SaslApiVersions versions) {
         OAuthBearerSaslClientCallbackHandler callbackHandler = new OAuthBearerSaslClientCallbackHandler(token);
         final SaslClient client;
         try {
