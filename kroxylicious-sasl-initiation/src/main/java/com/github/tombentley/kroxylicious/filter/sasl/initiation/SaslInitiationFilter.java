@@ -70,6 +70,7 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
     private final MechanismDriver mechanismDriver;
 
     private SaslExchangeState state = new SaslExchangeState.AwaitingTrigger();
+    private boolean forwardedInitialApiVersions;
     private @Nullable SaslApiVersions cachedApiVersions;
 
     /**
@@ -112,7 +113,21 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
 
         return switch (state) {
             case SaslExchangeState.AwaitingTrigger ignored -> {
-                if (apiKey == ApiKeys.API_VERSIONS) {
+                if (apiKey == ApiKeys.API_VERSIONS && !forwardedInitialApiVersions) {
+                    // A Java Kafka client using SASL sends ApiVersions twice: SaslClientAuthenticator sends v0
+                    // before the client's SaslHandshake to negotiate SASL API versions, and NetworkClient sends
+                    // another after the client's SASL exchange completes, before sending business requests.
+                    //
+                    // Without a SaslTermination filter the client's SaslHandshake/SaslAuthenticate reach the broker,
+                    // so the broker completes SASL and accepts the second ApiVersions request. With SaslTermination,
+                    // the termination filter answers the client's SASL frames and the broker never sees them. If this
+                    // filter forwarded both ApiVersions requests, the broker would still be in HANDSHAKE_REQUEST
+                    // after the first one and would reject the second as unexpected during SASL authentication.
+                    //
+                    // Forward only the first ApiVersions exchange before initiation. Treat any later ApiVersions
+                    // request as the trigger: authenticate the proxy to the broker first, then forward that request
+                    // after the broker's SASL exchange has completed.
+                    forwardedInitialApiVersions = true;
                     yield context.forwardRequest(header, request);
                 }
                 yield startAuthentication(context, header, request);

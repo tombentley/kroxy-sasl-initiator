@@ -250,8 +250,8 @@ The filter has no connection-established callback in the current `Filter` API. I
 
 Chosen rule:
 
-1. Forward the client's initial `ApiVersions` request/response normally, and cache the SASL API versions from the response for later use. This is important for subject mode: with `SaslTermination`, the client must complete its `ApiVersions` + SASL exchange before a subject exists. Holding `ApiVersions` would deadlock.
-2. On the first request that is **not** `ApiVersions` (and not a client SASL frame, which is rejected):
+1. Forward the client's initial `ApiVersions` request/response normally, and cache the SASL API versions from the response for later use. This is important for subject mode: with `SaslTermination`, the client must complete its `ApiVersions` + SASL exchange before a subject exists. Holding `ApiVersions` would deadlock. Only the first client `ApiVersions` exchange is forwarded before initiation. A Kafka client can send a second `ApiVersions` request after client SASL termination; forwarding it while the broker is still waiting for the proxy-initiated `SaslHandshake` makes the broker reject it as an unexpected `ApiVersions` request. Such a second `ApiVersions` request is therefore treated as the trigger and forwarded only after upstream authentication completes.
+2. On the first request that is **not** `ApiVersions` (and not a client SASL frame, which is rejected), or on a subsequent `ApiVersions` request after the initial one:
    * fixed mode: start upstream authentication immediately;
    * subject mode: resolve the subject; if eligible, start upstream authentication; otherwise fail closed.
 3. If the filter has not seen a usable client `ApiVersions` response (for example, because routing sent it to a different route, or the client omitted it), send the filter's own v0 `ApiVersions` request before the handshake.

@@ -3,10 +3,9 @@
 A standalone [Kroxylicious](https://kroxylicious.io) filter plugin that authenticates the proxy to an
 upstream Apache Kafka broker using SASL.
 
-This repository is at the bootstrap stage. The current commit establishes the Maven multi-module project, pins the
-supported dependency baseline, and provides a no-op `SaslInitiation` filter that proves plugin discovery and the
-proxy integration-test harness work end to end. Credential storage, identity selection, the SASL protocol state
-machine and reauthentication arrive in later commits.
+The project currently implements PKCS12 credential storage, the credential-management CLI, fixed and subject-derived
+identity selection, and PLAIN/SCRAM-SHA-256/SCRAM-SHA-512 initiation against a real Kafka broker. OAUTHBEARER and
+KIP-368 reauthentication arrive in later commits.
 
 ## Requirements
 
@@ -78,11 +77,39 @@ filterDefinitions:
   - name: sasl-initiation
     type: SaslInitiation
     config:
-      mechanism: PLAIN
+      mechanism: SCRAM-SHA-256
+      identity:
+        mode: fixed
+        key: proxy-service
+      keyStore:
+        file: /etc/kroxylicious/sasl-initiation.p12
+        filePassword:
+          passwordFile: /etc/kroxylicious/sasl-initiation.p12.password
 ```
 
-At this stage the filter forwards every request and response unchanged; `mechanism` is validated as non-empty but is
-not yet used to authenticate.
+Create the PKCS12 store with `sasl-initiation-credential-tool`; do not put broker passwords directly in the proxy YAML.
+
+## Composition and chain order
+
+Client-facing authentication must happen before SASL initiation, from the client towards the broker:
+
+```text
+client -> ... -> SaslTermination (optional) -> ... -> SaslInitiation (last) -> broker
+```
+
+* `SaslTermination` must see and terminate the client's `SaslHandshake`/`SaslAuthenticate` frames.
+* `SaslInitiation` must be last, so its own upstream SASL frames are not intercepted by another SASL filter.
+* An anonymous or mTLS-authenticated client can go directly to `SaslInitiation`; no client SASL termination is required.
+* If client SASL frames reach `SaslInitiation` (no termination filter, or `SaslInitiation` placed before
+  `SaslTermination`), the filter rejects the handshake with `UNSUPPORTED_SASL_MECHANISM` and closes the connection.
+  This is a misconfiguration, not a supported passthrough mode.
+
+Use a separate credential store for initiation credentials and for any client-facing SCRAM credential store. The
+integration-test composition matrix covers this separation, mapped identities, mechanism translation, mTLS, anonymous
+clients, and the unsafe configurations above.
+
+Kroxylicious 0.26.0 `SaslTermination` supports SCRAM and OAUTHBEARER, but not PLAIN. A client-facing PLAIN terminator is
+therefore not tested; the composition tests use SCRAM client termination.
 
 ## License
 

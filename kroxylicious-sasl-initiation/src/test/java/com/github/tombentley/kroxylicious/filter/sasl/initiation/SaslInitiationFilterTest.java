@@ -106,6 +106,39 @@ class SaslInitiationFilterTest {
     }
 
     @Test
+    void treatsASecondClientApiVersionsAsTriggerAfterForwardingTheFirst() {
+        FakeSaslBroker broker = new FakeSaslBroker().withSessionLifetimeMs(5000);
+        SaslInitiationFilter filter = filter(Mechanism.PLAIN);
+
+        RequestHeaderData firstHeader = header(ApiKeys.API_VERSIONS);
+        ApiVersionsRequestData firstRequest = new ApiVersionsRequestData();
+        assertThat(filter.onRequest(ApiKeys.API_VERSIONS, (short) 0, firstHeader, firstRequest, context(firstHeader, firstRequest)))
+                .succeedsWithin(Duration.ZERO)
+                .satisfies(result -> MockFilterContextAssert.assertThat(result).isForwardRequest());
+        assertThat(filter.state()).isInstanceOf(SaslExchangeState.AwaitingTrigger.class);
+
+        ResponseHeaderData responseHeader = new ResponseHeaderData();
+        ApiVersionsResponseData response = FakeSaslBroker.apiVersionsResponse();
+        assertThat(filter.onApiVersionsResponse((short) 0, responseHeader, response, context(responseHeader, response)))
+                .succeedsWithin(Duration.ZERO);
+
+        RequestHeaderData secondHeader = header(ApiKeys.API_VERSIONS);
+        ApiVersionsRequestData secondRequest = new ApiVersionsRequestData();
+        assertThat(filter.onRequest(ApiKeys.API_VERSIONS, (short) 0, secondHeader, secondRequest,
+                context(secondHeader, secondRequest, broker)))
+                .succeedsWithin(Duration.ZERO)
+                .satisfies(result -> MockFilterContextAssert.assertThat(result)
+                        .isForwardRequest()
+                        .hasHeaderEqualTo(secondHeader)
+                        .hasMessageEqualTo(secondRequest));
+
+        assertThat(filter.state()).isInstanceOf(SaslExchangeState.Authenticated.class);
+        assertThat(broker.capturedRequests())
+                .extracting(captured -> captured.request().apiKey())
+                .containsExactly(ApiKeys.SASL_HANDSHAKE.id, ApiKeys.SASL_AUTHENTICATE.id);
+    }
+
+    @Test
     void sendsItsOwnV0ApiVersionsWhenTheClientDidNot() {
         FakeSaslBroker broker = new FakeSaslBroker();
         SaslInitiationFilter filter = filter(Mechanism.PLAIN);

@@ -1,1 +1,2 @@
 com.github.tombentley.kroxylicious.filter.sasl.initiation.it.FixedSubjectFilter
+com.github.tombentley.kroxylicious.filter.sasl.initiation.it.CompositionObserverFilter
