@@ -70,7 +70,7 @@ import edu.umd.cs.findbugs.annotations.Nullable;
  * misordered the client-facing authentication filter, so those frames are rejected with a SASL-specific error.
  * </p>
  */
-class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
+final class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(SaslInitiationFilter.class);
     private static final byte[] EMPTY_BYTES = new byte[0];
@@ -711,10 +711,10 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
                 .addKeyValue("errorCode", Errors.UNKNOWN_SERVER_ERROR.code())
                 .addKeyValue("reason", reason);
         if (error instanceof SaslExchangeException saslExchangeException) {
-            event.addKeyValue("brokerErrorCode", saslExchangeException.brokerErrorCode());
+            event = event.addKeyValue("brokerErrorCode", saslExchangeException.brokerErrorCode());
         }
         if (error != null) {
-            event.addKeyValue("errorType", error.getClass().getSimpleName());
+            event = event.addKeyValue("errorType", error.getClass().getSimpleName());
         }
         event.log("KIP-368 SASL reauthentication failed");
     }

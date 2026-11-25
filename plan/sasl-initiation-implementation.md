@@ -1890,9 +1890,13 @@ with the example config; the full test matrix is green.
   Expected-subject mapping is deployment-defined; token exchange remains out of scope.
 * **KeyStore plaintext in memory.** The proxy must hold plaintext credentials/tokens in memory. Document the residual
   risk; the destroyable-secret wrapper only reduces avoidable copies.
-* **Pipelined frames during auth.** The filter relies on runtime backpressure. The pipelining ITs must verify that
-  already-decoded frames remain bounded; if not, fix the runtime's deferred-stage handling rather than adding a filter
-  queue.
+* **Pipelined frames during auth.** The filter relies on runtime backpressure and keeps no request queue.
+  Commit 12's `SaslInitiationPipeliningIT` pipelines 400 metadata requests while a delayed `SaslAuthenticate` keeps the
+  deferred stage open. It confirms that only the in-flight request is dispatched, no business request reaches the broker
+  before authentication or reauthentication completes, and requests are forwarded in order after release. The runtime
+  still decodes frames already present in the Netty read buffer and chains them in `FilterHandler.readFuture`; that
+  memory is bounded by the read/socket buffer and the deferred-stage timeout, not by request count. Revisit if a runtime
+  read-batch or byte limit is introduced; do not add a filter-level queue.
 * **Kafka API versions.** The filter requires handshake v1+ and authenticate v1+ (for session lifetime). Kafka 4.0+ is
   the supported floor. Test the floor in the nightly compatibility job.
 * **Secret leakage via errors.** Only log sanitized broker error codes/messages; never forward broker error text.
@@ -1927,7 +1931,7 @@ with the example config; the full test matrix is green.
 | 7 | Pipelining during auth (stage incomplete, no buffer) | protocol | 5 |
 | 8 | SCRAM-256/512 fixed identity | protocol + IT | 6 |
 | 9 | Subject mode + mapped username + fail closed | protocol + IT | 7 |
-| 10 | Subject change after auth | protocol | 7 |
+| 10 | Subject change after auth (generic error + close; fixed mode unaffected) | protocol + IT | 7, 12 |
 | 11 | SaslTermination SCRAM -> upstream PLAIN/SCRAM | IT | 8 |
 | 12 | mTLS -> upstream SCRAM | IT | 8 |
 | 13 | Chain order/misorder + passthrough rejection | IT | 8 |
@@ -1936,7 +1940,7 @@ with the example config; the full test matrix is green.
 | 16 | OAuth subject mode + expected subject | IT | 10 |
 | 17 | Reauth deadline/jitter/fresh client/subject guard | unit/protocol | 11 |
 | 18 | Reauth against real Kafka with short lifetime | IT | 12 |
-| 19 | Pipelining/backpressure during reauth | IT | 12 |
+| 19 | Pipelining/backpressure during auth and reauth | protocol + IT | 5, 12 |
 | 20 | Routing per-leaf-route credentials | IT | 13 |
 | 21 | Metrics/log redaction | unit + IT | 14 |
 | 22 | Docs/examples validated | unit/docs | 15 |
