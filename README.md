@@ -108,6 +108,72 @@ Use a separate credential store for initiation credentials and for any client-fa
 integration-test composition matrix covers this separation, mapped identities, mechanism translation, mTLS, anonymous
 clients, and the unsafe configurations above.
 
+### Routing
+
+When the virtual cluster uses a router, configure `SaslInitiation` on each **leaf route's** filter chain, not on the
+virtual-cluster filter chain. Each leaf route then authenticates its own upstream connection and can use its own
+credential store:
+
+```yaml
+filterDefinitions:
+  - name: sasl-initiation-route-a
+    type: SaslInitiation
+    config:
+      mechanism: SCRAM-SHA-256
+      identity:
+        mode: fixed
+        key: route-a-service
+      keyStore:
+        file: /etc/kroxylicious/route-a.p12
+        filePassword:
+          passwordFile: /etc/kroxylicious/route-a.p12.password
+
+  - name: sasl-initiation-route-b
+    type: SaslInitiation
+    config:
+      mechanism: SCRAM-SHA-256
+      identity:
+        mode: fixed
+        key: route-b-service
+      keyStore:
+        file: /etc/kroxylicious/route-b.p12
+        filePassword:
+          passwordFile: /etc/kroxylicious/route-b.p12.password
+
+routerDefinitions:
+  - name: leaf-router
+    type: <router plugin type>
+    config: {}
+    routes:
+      - name: route-a
+        id: 0
+        filters: [sasl-initiation-route-a]
+        target:
+          cluster: cluster-a
+      - name: route-b
+        id: 1
+        filters: [sasl-initiation-route-b]
+        target:
+          cluster: cluster-b
+
+virtualClusters:
+  - name: demo
+    target:
+      router: leaf-router
+    # Client-facing authentication may go here, but not SaslInitiation.
+    filters: [sasl-termination]
+    gateways:
+      - name: default
+        portIdentifiesNode:
+          bootstrapAddress: localhost:9192
+```
+
+A virtual-cluster-level initiator is **not** a supported routing placement. It runs before the router selects a target,
+so it cannot authenticate every leaf route and its internal SASL frames can go to the wrong upstream (or to no target).
+The runtime does not currently reject this configuration. Use one leaf route per upstream connection; routes that
+resolve to the same upstream address can share a connection and therefore cannot have independent per-route
+credentials.
+
 Kroxylicious 0.26.0 `SaslTermination` supports SCRAM and OAUTHBEARER, but not PLAIN. A client-facing PLAIN terminator is
 therefore not tested; the composition tests use SCRAM client termination.
 

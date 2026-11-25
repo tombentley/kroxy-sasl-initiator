@@ -1479,6 +1479,14 @@ per-target credentials and independent authentication state.
 * Documentation updates for leaf-route placement.
 * Any small logging/clarity fixes.
 
+**Implementation notes**
+
+* The routing IT uses two real Kafka clusters, not two routes to the same cluster. The runtime caches upstream
+  connections by target address, so two routes to the same broker address share one connection; independent per-route
+  credentials require distinct upstream targets.
+* Routing is gated by `Feature.ROUTING` in the test harness.
+* The leaf-route configuration example lives in `plan/sasl-initiation.md` §6.1 and the README.
+
 **Prompt**
 
 ~~~text
