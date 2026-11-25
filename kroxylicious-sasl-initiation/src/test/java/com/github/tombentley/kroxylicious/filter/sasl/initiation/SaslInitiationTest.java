@@ -23,9 +23,12 @@ import com.github.tombentley.kroxylicious.filter.sasl.initiation.config.Identity
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.config.IdentityMode;
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.config.KeyStoreConfig;
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.config.Mechanism;
+import com.github.tombentley.kroxylicious.filter.sasl.initiation.config.OAuthBearerConfig;
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.config.ReauthConfig;
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.config.SaslInitiationConfig;
+import com.github.tombentley.kroxylicious.filter.sasl.initiation.credentials.CredentialKind;
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.credentials.KeyStorePermissions;
+import com.github.tombentley.kroxylicious.filter.sasl.initiation.credentials.OAuthClientCredential;
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.credentials.SubjectAlias;
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.identity.FixedIdentitySelector;
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.identity.SubjectIdentitySelector;
@@ -225,6 +228,83 @@ class SaslInitiationTest {
                         .isForwardResponse()
                         .hasHeaderEqualTo(header)
                         .hasMessageEqualTo(response));
+    }
+
+    @Test
+    void initializesOAuthSubjectModeWithRealStore() throws Exception {
+        Path storeFile = tempDir.resolve("oauth.p12");
+        TestStores.writeOAuthStore(storeFile,
+                new TestStores.OAuthEntry("alice", "alice-client", "client-secret", null));
+        SaslInitiationConfig config = new SaslInitiationConfig(
+                Mechanism.OAUTHBEARER,
+                new IdentityConfig(IdentityMode.SUBJECT, null),
+                new KeyStoreConfig(storeFile.toString(), TestStores.passwordProvider(STORE_PASSWORD)),
+                new OAuthBearerConfig("https://idp.example.com/token", "kafka"));
+
+        SaslInitiationRuntimeConfig runtime = factory.initialize(context, config);
+        try {
+            assertThat(runtime.credentialStore()).isNotNull();
+            assertThat(runtime.credentialStore().kind()).isEqualTo(CredentialKind.OAUTH);
+            assertThat(runtime.oauthTokenService()).isNotNull();
+            assertThat(runtime.oauthTokenService().usesStaticTokenFile()).isFalse();
+            assertThat(runtime.credentialStore().require("alice"))
+                    .isInstanceOfSatisfying(OAuthClientCredential.class,
+                            credential -> assertThat(credential.expectedSubject()).isEqualTo("alice"));
+        }
+        finally {
+            factory.close(runtime);
+        }
+    }
+
+    @Test
+    void initializesOAuthFixedTokenFileWithoutAKeyStore() {
+        SaslInitiationConfig config = new SaslInitiationConfig(
+                Mechanism.OAUTHBEARER,
+                new IdentityConfig(IdentityMode.FIXED, "proxy-service"),
+                null,
+                new OAuthBearerConfig("file:/etc/kroxylicious/token.jwt", null));
+
+        SaslInitiationRuntimeConfig runtime = factory.initialize(context, config);
+        try {
+            assertThat(runtime.credentialStore()).isNull();
+            assertThat(runtime.oauthTokenService()).isNotNull();
+            assertThat(runtime.oauthTokenService().usesStaticTokenFile()).isTrue();
+        }
+        finally {
+            factory.close(runtime);
+        }
+    }
+
+    @Test
+    void failsInitializationWhenOAuthStoreContainsPasswordEntries() throws Exception {
+        Path storeFile = tempDir.resolve("credentials.p12");
+        TestStores.writePasswordStore(storeFile, "proxy-service");
+        SaslInitiationConfig config = new SaslInitiationConfig(
+                Mechanism.OAUTHBEARER,
+                new IdentityConfig(IdentityMode.FIXED, "proxy-service"),
+                new KeyStoreConfig(storeFile.toString(), TestStores.passwordProvider(STORE_PASSWORD)),
+                new OAuthBearerConfig("https://idp.example.com/token", null));
+
+        assertThatThrownBy(() -> factory.initialize(context, config))
+                .isInstanceOf(PluginConfigurationException.class)
+                .hasMessageContaining("PASSWORD")
+                .hasMessageContaining("OAUTH");
+    }
+
+    @Test
+    void failsInitializationWhenTheFixedOAuthKeyIsMissing() throws Exception {
+        Path storeFile = tempDir.resolve("oauth.p12");
+        TestStores.writeOAuthStore(storeFile, new TestStores.OAuthEntry("bob", "bob-client", "client-secret", "bob"));
+        SaslInitiationConfig config = new SaslInitiationConfig(
+                Mechanism.OAUTHBEARER,
+                new IdentityConfig(IdentityMode.FIXED, "alice"),
+                new KeyStoreConfig(storeFile.toString(), TestStores.passwordProvider(STORE_PASSWORD)),
+                new OAuthBearerConfig("https://idp.example.com/token", null));
+
+        assertThatThrownBy(() -> factory.initialize(context, config))
+                .isInstanceOf(PluginConfigurationException.class)
+                .hasMessageContaining("No OAUTH credential")
+                .hasMessageContaining("alice");
     }
 
     private static SaslInitiationConfig config(Mechanism mechanism,

@@ -47,6 +47,16 @@ public final class CredentialResolver {
     }
 
     /**
+     * Creates a resolver that never finds a credential. It is used for fixed-identity OAUTHBEARER with a static token
+     * file, where no KeyStore entry is required.
+     *
+     * @return an empty resolver
+     */
+    public static CredentialResolver empty() {
+        return new CredentialResolver(lookupKey -> Optional.empty());
+    }
+
+    /**
      * Resolves the credential for a lookup key.
      *
      * @param lookupKey the subject lookup key

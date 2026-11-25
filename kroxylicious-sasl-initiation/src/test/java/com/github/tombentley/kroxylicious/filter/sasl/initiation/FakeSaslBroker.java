@@ -6,6 +6,7 @@
 
 package com.github.tombentley.kroxylicious.filter.sasl.initiation;
 
+import java.io.IOException;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -19,9 +20,17 @@ import java.util.concurrent.CompletionStage;
 import javax.security.auth.callback.Callback;
 import javax.security.auth.callback.CallbackHandler;
 import javax.security.auth.callback.NameCallback;
+import javax.security.auth.callback.UnsupportedCallbackException;
+import javax.security.auth.login.AppConfigurationEntry;
 import javax.security.sasl.SaslException;
 import javax.security.sasl.SaslServer;
 
+import org.apache.kafka.common.security.auth.AuthenticateCallbackHandler;
+import org.apache.kafka.common.security.oauthbearer.OAuthBearerExtensionsValidatorCallback;
+import org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule;
+import org.apache.kafka.common.security.oauthbearer.OAuthBearerToken;
+import org.apache.kafka.common.security.oauthbearer.OAuthBearerValidatorCallback;
+import org.apache.kafka.common.security.oauthbearer.internals.OAuthBearerSaslServer;
 import org.apache.kafka.common.security.plain.PlainAuthenticateCallback;
 import org.apache.kafka.common.security.plain.internals.PlainSaslServer;
 import org.apache.kafka.common.security.plain.internals.PlainSaslServerProvider;
@@ -70,6 +79,7 @@ final class FakeSaslBroker implements MockFilterContext.SendRequestHandler {
     private boolean includeSaslApiVersions = true;
     private long sessionLifetimeMs;
     private boolean unexpectedTokenAfterCompletion;
+    private @Nullable OAuthBearerToken oauthBearerToken;
     private @Nullable RuntimeException sendRequestFailure;
     private @Nullable CompletableFuture<ApiMessage> pendingHandshake;
     private @Nullable String pendingHandshakeMechanism;
@@ -105,6 +115,12 @@ final class FakeSaslBroker implements MockFilterContext.SendRequestHandler {
 
     FakeSaslBroker withoutSaslApiVersions() {
         this.includeSaslApiVersions = false;
+        return this;
+    }
+
+    FakeSaslBroker withOAuthBearerToken(OAuthBearerToken token) {
+        this.oauthBearerToken = token;
+        this.saslServer = null;
         return this;
     }
 
@@ -180,6 +196,9 @@ final class FakeSaslBroker implements MockFilterContext.SendRequestHandler {
             catch (NoSuchAlgorithmException e) {
                 throw new IllegalStateException("Could not create the fake SCRAM server", e);
             }
+        }
+        else if (OAuthBearerLoginModule.OAUTHBEARER_MECHANISM.equals(requestedMechanism) && oauthBearerToken != null) {
+            saslServer = new OAuthBearerSaslServer(oauthCallbackHandler(oauthBearerToken));
         }
         else {
             return handshakeError();
@@ -260,6 +279,40 @@ final class FakeSaslBroker implements MockFilterContext.SendRequestHandler {
             }
             if (credentialCallback != null) {
                 credentialCallback.scramCredential(username.equals(presentedUsername) ? expectedCredential : null);
+            }
+        };
+    }
+
+    private static AuthenticateCallbackHandler oauthCallbackHandler(OAuthBearerToken expectedToken) {
+        return new AuthenticateCallbackHandler() {
+            @Override
+            public void configure(Map<String, ?> configs, String saslMechanism, List<AppConfigurationEntry> jaasConfigEntries) {
+                // Nothing to configure.
+            }
+
+            @Override
+            public void handle(Callback[] callbacks) throws IOException, UnsupportedCallbackException {
+                for (Callback callback : callbacks) {
+                    if (callback instanceof OAuthBearerValidatorCallback validatorCallback) {
+                        if (expectedToken.value().equals(validatorCallback.tokenValue())) {
+                            validatorCallback.token(expectedToken);
+                        }
+                        else {
+                            validatorCallback.error("invalid_token", null, null);
+                        }
+                    }
+                    else if (callback instanceof OAuthBearerExtensionsValidatorCallback) {
+                        // Accept no extensions.
+                    }
+                    else {
+                        throw new UnsupportedCallbackException(callback, "Unsupported fake OAuth callback");
+                    }
+                }
+            }
+
+            @Override
+            public void close() {
+                // Nothing to close.
             }
         };
     }

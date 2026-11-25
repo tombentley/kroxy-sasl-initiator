@@ -10,8 +10,6 @@ import javax.security.auth.callback.CallbackHandler;
 import javax.security.sasl.SaslClient;
 import javax.security.sasl.SaslException;
 
-import com.github.tombentley.kroxylicious.filter.sasl.initiation.credentials.PasswordCredential;
-
 /**
  * Creates the mechanism-specific {@link SaslClient} used by the generic challenge/response exchange.
  * <p>
@@ -24,10 +22,9 @@ interface MechanismDriver {
     /**
      * Creates a SASL client for one authentication exchange.
      *
-     * @param credential the broker credential for the exchange
      * @param callbackHandler the callback handler that supplies mechanism-specific callbacks
      * @return a new SASL client
      * @throws SaslException if the client cannot be created
      */
-    SaslClient createSaslClient(PasswordCredential credential, CallbackHandler callbackHandler) throws SaslException;
+    SaslClient createSaslClient(CallbackHandler callbackHandler) throws SaslException;
 }

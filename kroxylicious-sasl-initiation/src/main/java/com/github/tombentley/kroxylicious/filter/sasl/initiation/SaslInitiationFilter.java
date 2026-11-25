@@ -14,16 +14,21 @@ import java.util.concurrent.CompletionStage;
 import javax.security.sasl.SaslClient;
 import javax.security.sasl.SaslException;
 
+import org.apache.kafka.common.security.oauthbearer.OAuthBearerToken;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.config.IdentityMode;
+import com.github.tombentley.kroxylicious.filter.sasl.initiation.config.Mechanism;
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.config.SaslInitiationConfig;
+import com.github.tombentley.kroxylicious.filter.sasl.initiation.credentials.CredentialKind;
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.credentials.DestroyableSecret;
+import com.github.tombentley.kroxylicious.filter.sasl.initiation.credentials.OAuthClientCredential;
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.credentials.PasswordCredential;
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.identity.IdentityGuard;
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.identity.IdentitySelector;
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.identity.IdentitySnapshot;
+import com.github.tombentley.kroxylicious.filter.sasl.initiation.oauth.OAuthTokenService;
 
 import io.kroxylicious.kafka.common.message.ApiVersionsRequestData;
 import io.kroxylicious.kafka.common.message.ApiVersionsResponseData;
@@ -38,6 +43,7 @@ import io.kroxylicious.kafka.common.protocol.ApiMessage;
 import io.kroxylicious.kafka.common.protocol.Errors;
 import io.kroxylicious.proxy.filter.ApiVersionsResponseFilter;
 import io.kroxylicious.proxy.filter.FilterContext;
+import io.kroxylicious.proxy.filter.FilterDispatchExecutor;
 import io.kroxylicious.proxy.filter.RequestFilter;
 import io.kroxylicious.proxy.filter.RequestFilterResult;
 import io.kroxylicious.proxy.filter.ResponseFilterResult;
@@ -67,25 +73,40 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
     private final CredentialResolver credentialResolver;
     private final IdentitySelector identitySelector;
     private final IdentityGuard identityGuard;
-    private final MechanismDriver mechanismDriver;
+    private final @Nullable OAuthTokenService oauthTokenService;
+    private final @Nullable FilterDispatchExecutor filterDispatchExecutor;
 
     private SaslExchangeState state = new SaslExchangeState.AwaitingTrigger();
     private boolean forwardedInitialApiVersions;
     private @Nullable SaslApiVersions cachedApiVersions;
 
     /**
-     * Creates a per-connection filter.
+     * Creates a per-connection filter using an executor that completes work inline. Production code must use
+     * {@link #SaslInitiationFilter(SaslInitiationRuntimeConfig, FilterDispatchExecutor)} so OAuth token retrieval can
+     * return to the connection's filter-dispatch thread.
      *
      * @param runtimeConfig the shared runtime configuration
      */
     SaslInitiationFilter(SaslInitiationRuntimeConfig runtimeConfig) {
+        this(runtimeConfig, null);
+    }
+
+    /**
+     * Creates a per-connection filter.
+     *
+     * @param runtimeConfig the shared runtime configuration
+     * @param filterDispatchExecutor the connection's filter-dispatch executor, or {@code null} in tests that do not use
+     *            OAuth
+     */
+    SaslInitiationFilter(SaslInitiationRuntimeConfig runtimeConfig, @Nullable FilterDispatchExecutor filterDispatchExecutor) {
         this.config = runtimeConfig.config();
         this.credentialResolver = runtimeConfig.credentialResolver();
         this.identitySelector = runtimeConfig.identitySelector();
+        this.oauthTokenService = runtimeConfig.oauthTokenService();
+        this.filterDispatchExecutor = filterDispatchExecutor;
         this.identityGuard = config.identity().mode() == IdentityMode.SUBJECT
                 ? IdentityGuard.forSubject(identitySelector)
                 : IdentityGuard.disabled();
-        this.mechanismDriver = new PasswordMechanismDriver(config.mechanism());
     }
 
     @Override
@@ -217,10 +238,30 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
 
     private CompletionStage<SaslExchangeState.AuthenticationResult> authenticate(FilterContext context) {
         final IdentitySnapshot identity;
-        final PasswordCredential credential;
         try {
             identity = identitySelector.select(context);
             identityGuard.expect(identity);
+        }
+        catch (RuntimeException e) {
+            LOGGER.atWarn()
+                    .addKeyValue("mechanism", config.mechanism())
+                    .addKeyValue("errorType", e.getClass().getSimpleName())
+                    .log("SASL initiation could not select a broker identity");
+            LOGGER.atDebug()
+                    .setCause(e)
+                    .log("SASL initiation identity selection detail");
+            return CompletableFuture.completedFuture(SaslExchangeState.AuthenticationResult.failure());
+        }
+
+        return config.mechanism() == Mechanism.OAUTHBEARER
+                ? authenticateOAuthBearer(context, identity)
+                : authenticatePassword(context, identity);
+    }
+
+    private CompletionStage<SaslExchangeState.AuthenticationResult> authenticatePassword(FilterContext context,
+                                                                                         IdentitySnapshot identity) {
+        final PasswordCredential credential;
+        try {
             CredentialResolver.ResolvedCredential resolved = credentialResolver.resolve(
                     identity.lookupKey(),
                     config.mechanism().credentialKind());
@@ -231,13 +272,7 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
             credential = passwordCredential;
         }
         catch (RuntimeException e) {
-            LOGGER.atWarn()
-                    .addKeyValue("mechanism", config.mechanism())
-                    .addKeyValue("errorType", e.getClass().getSimpleName())
-                    .log("SASL initiation could not select a usable broker credential");
-            LOGGER.atDebug()
-                    .setCause(e)
-                    .log("SASL initiation identity/credential selection detail");
+            logCredentialSelectionFailure(e);
             return CompletableFuture.completedFuture(SaslExchangeState.AuthenticationResult.failure());
         }
 
@@ -251,8 +286,71 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
 
         CompletionStage<Long> exchange = resolveApiVersions(context)
                 .thenCompose(versions -> sendHandshake(context, versions))
-                .thenCompose(versions -> performExchange(context, credential, versions));
+                .thenCompose(versions -> performPasswordExchange(context, credential, versions));
 
+        return completeExchange(context, identity, subject, brokerUsername, exchange);
+    }
+
+    private CompletionStage<SaslExchangeState.AuthenticationResult> authenticateOAuthBearer(FilterContext context,
+                                                                                            IdentitySnapshot identity) {
+        final OAuthTokenService tokenService = oauthTokenService;
+        if (tokenService == null) {
+            LOGGER.atWarn()
+                    .addKeyValue("mechanism", config.mechanism())
+                    .log("SASL initiation has no OAuth token service configured");
+            return CompletableFuture.completedFuture(SaslExchangeState.AuthenticationResult.failure());
+        }
+
+        final @Nullable OAuthClientCredential credential;
+        try {
+            credential = selectOAuthCredential(identity);
+        }
+        catch (RuntimeException e) {
+            logCredentialSelectionFailure(e);
+            return CompletableFuture.completedFuture(SaslExchangeState.AuthenticationResult.failure());
+        }
+
+        final String subject = identity.lookupKey();
+        final String tokenPrincipal = credential == null ? subject : credential.expectedSubject();
+        LOGGER.atDebug()
+                .addKeyValue("mechanism", config.mechanism())
+                .addKeyValue("subject", subject)
+                .addKeyValue("tokenPrincipal", tokenPrincipal)
+                .log("Selected the OAuth token source for SASL initiation");
+
+        CompletionStage<OAuthBearerToken> tokenStage = tokenService.token(subject, credential);
+        CompletionStage<OAuthBearerToken> dispatchStage = filterDispatchExecutor == null
+                ? tokenStage
+                : filterDispatchExecutor.completeOnFilterDispatchThread(tokenStage);
+
+        CompletionStage<Long> exchange = dispatchStage
+                .thenCompose(token -> resolveApiVersions(context)
+                        .thenCompose(versions -> sendHandshake(context, versions))
+                        .thenCompose(versions -> performOAuthBearerExchange(context, token, versions)));
+
+        return completeExchange(context, identity, subject, tokenPrincipal, exchange);
+    }
+
+    private @Nullable OAuthClientCredential selectOAuthCredential(IdentitySnapshot identity) {
+        OAuthTokenService tokenService = Objects.requireNonNull(oauthTokenService, "oauthTokenService");
+        if (tokenService.usesStaticTokenFile()) {
+            return null;
+        }
+        CredentialResolver.ResolvedCredential resolved = credentialResolver.resolve(
+                identity.lookupKey(),
+                CredentialKind.OAUTH);
+        if (!(resolved.credential() instanceof OAuthClientCredential oauthCredential)) {
+            throw new CredentialResolver.CredentialResolutionException(
+                    "The selected credential is not usable by the configured mechanism");
+        }
+        return oauthCredential;
+    }
+
+    private CompletionStage<SaslExchangeState.AuthenticationResult> completeExchange(FilterContext context,
+                                                                                     IdentitySnapshot identity,
+                                                                                     String subject,
+                                                                                     String brokerIdentity,
+                                                                                     CompletionStage<Long> exchange) {
         return exchange.handle((sessionLifetimeMs, error) -> {
             if (error != null) {
                 logExchangeFailure(error);
@@ -270,11 +368,21 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
             LOGGER.atInfo()
                     .addKeyValue("mechanism", config.mechanism())
                     .addKeyValue("subject", subject)
-                    .addKeyValue("brokerUsername", brokerUsername)
+                    .addKeyValue("brokerIdentity", brokerIdentity)
                     .log("SASL initiation authenticated the upstream connection");
             return SaslExchangeState.AuthenticationResult.success(
                     Objects.requireNonNull(sessionLifetimeMs, "sessionLifetimeMs"));
         });
+    }
+
+    private void logCredentialSelectionFailure(RuntimeException e) {
+        LOGGER.atWarn()
+                .addKeyValue("mechanism", config.mechanism())
+                .addKeyValue("errorType", e.getClass().getSimpleName())
+                .log("SASL initiation could not select a usable broker credential");
+        LOGGER.atDebug()
+                .setCause(e)
+                .log("SASL initiation identity/credential selection detail");
     }
 
     private CompletionStage<RequestFilterResult> forwardWithIdentityCheck(FilterContext context,
@@ -345,34 +453,52 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
                 });
     }
 
-    private CompletionStage<Long> performExchange(FilterContext context,
-                                                  PasswordCredential storedCredential,
-                                                  SaslApiVersions versions) {
+    private CompletionStage<Long> performPasswordExchange(FilterContext context,
+                                                          PasswordCredential storedCredential,
+                                                          SaslApiVersions versions) {
         PasswordCredential exchangeCredential = new PasswordCredential(
                 storedCredential.username(),
                 DestroyableSecret.of(storedCredential.password().chars()));
         SaslClientCallbackHandler callbackHandler = new SaslClientCallbackHandler(exchangeCredential);
         final SaslClient client;
         try {
-            client = mechanismDriver.createSaslClient(exchangeCredential, callbackHandler);
+            client = new PasswordMechanismDriver(config.mechanism()).createSaslClient(callbackHandler);
         }
         catch (SaslException | RuntimeException e) {
             closeExchange(null, callbackHandler, exchangeCredential);
             return CompletableFuture.failedFuture(new SaslExchangeException("Could not create the SASL client", e));
         }
+        return startExchange(context, client, versions)
+                .whenComplete((ignored, error) -> closeExchange(client, callbackHandler, exchangeCredential));
+    }
 
-        CompletionStage<Long> exchange;
+    private CompletionStage<Long> performOAuthBearerExchange(FilterContext context,
+                                                             OAuthBearerToken token,
+                                                             SaslApiVersions versions) {
+        OAuthBearerSaslClientCallbackHandler callbackHandler = new OAuthBearerSaslClientCallbackHandler(token);
+        final SaslClient client;
+        try {
+            client = new OAuthBearerMechanismDriver().createSaslClient(callbackHandler);
+        }
+        catch (SaslException | RuntimeException e) {
+            callbackHandler.close();
+            return CompletableFuture.failedFuture(new SaslExchangeException("Could not create the SASL client", e));
+        }
+        return startExchange(context, client, versions)
+                .whenComplete((ignored, error) -> closeExchange(client, callbackHandler));
+    }
+
+    private CompletionStage<Long> startExchange(FilterContext context, SaslClient client, SaslApiVersions versions) {
         try {
             byte[] initialToken = client.hasInitialResponse()
                     ? client.evaluateChallenge(EMPTY_BYTES)
                     : EMPTY_BYTES;
-            exchange = sendAuthenticate(context, client, versions, initialToken == null ? EMPTY_BYTES : initialToken);
+            return sendAuthenticate(context, client, versions, initialToken == null ? EMPTY_BYTES : initialToken);
         }
         catch (SaslException | RuntimeException e) {
-            closeExchange(client, callbackHandler, exchangeCredential);
-            exchange = CompletableFuture.failedFuture(new SaslExchangeException("The SASL client rejected the initial challenge", e));
+            return CompletableFuture.failedFuture(new SaslExchangeException(
+                    "The SASL client rejected the initial challenge", e));
         }
-        return exchange.whenComplete((ignored, error) -> closeExchange(client, callbackHandler, exchangeCredential));
     }
 
     private CompletionStage<Long> sendAuthenticate(FilterContext context,
@@ -411,7 +537,7 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
                                 "The SASL client rejected the broker challenge", e));
                     }
                     if (nextToken == null && client.isComplete()) {
-                        // SCRAM consumes the broker's final server message and must not send another token.
+                        // SCRAM and OAUTHBEARER consume the broker's final server message and send no further token.
                         return CompletableFuture.completedFuture(sessionLifetimeMs);
                     }
                     return sendAuthenticate(context, client, versions, nextToken == null ? EMPTY_BYTES : nextToken);
@@ -430,6 +556,17 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
     private static void closeExchange(@Nullable SaslClient client,
                                       SaslClientCallbackHandler callbackHandler,
                                       PasswordCredential credential) {
+        closeClient(client);
+        callbackHandler.close();
+        credential.destroy();
+    }
+
+    private static void closeExchange(@Nullable SaslClient client, OAuthBearerSaslClientCallbackHandler callbackHandler) {
+        closeClient(client);
+        callbackHandler.close();
+    }
+
+    private static void closeClient(@Nullable SaslClient client) {
         if (client != null) {
             try {
                 client.dispose();
@@ -438,8 +575,6 @@ class SaslInitiationFilter implements RequestFilter, ApiVersionsResponseFilter {
                 // Best effort: authentication has already completed or failed.
             }
         }
-        callbackHandler.close();
-        credential.destroy();
     }
 
     private static void logExchangeFailure(Throwable error) {

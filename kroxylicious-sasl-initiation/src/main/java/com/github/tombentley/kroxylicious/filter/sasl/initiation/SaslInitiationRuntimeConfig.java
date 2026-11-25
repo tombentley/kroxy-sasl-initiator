@@ -11,25 +11,30 @@ import java.util.Objects;
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.config.SaslInitiationConfig;
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.credentials.KeyStoreCredentialStore;
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.identity.IdentitySelector;
+import com.github.tombentley.kroxylicious.filter.sasl.initiation.oauth.OAuthTokenService;
+
+import edu.umd.cs.findbugs.annotations.Nullable;
 
 /**
  * Immutable initialization data produced once per virtual cluster by {@link SaslInitiation#initialize}.
  * <p>
- * It contains the validated configuration, the loaded credential store and the identity selector. The store is loaded
- * and validated during initialization so configuration errors fail at startup rather than on the first client
- * connection.
+ * It contains the validated configuration, the loaded credential store, the identity selector and, for OAUTHBEARER,
+ * the shared token service. The store is loaded and validated during initialization so configuration errors fail at
+ * startup rather than on the first client connection.
  * </p>
  *
  * @param config the validated plugin configuration
- * @param credentialStore the loaded credential store
+ * @param credentialStore the loaded credential store, or {@code null} for a fixed OAuth token file
  * @param identitySelector the selector that maps a request to a credential lookup key
  * @param credentialResolver the resolver that maps a lookup key to a validated stored credential
+ * @param oauthTokenService the shared OAuth token service, or {@code null} for password mechanisms
  */
 public record SaslInitiationRuntimeConfig(
                                           SaslInitiationConfig config,
-                                          KeyStoreCredentialStore credentialStore,
+                                          @Nullable KeyStoreCredentialStore credentialStore,
                                           IdentitySelector identitySelector,
-                                          CredentialResolver credentialResolver) {
+                                          CredentialResolver credentialResolver,
+                                          @Nullable OAuthTokenService oauthTokenService) {
 
     /**
      * Creates a runtime configuration using a resolver backed by the supplied store.
@@ -41,7 +46,22 @@ public record SaslInitiationRuntimeConfig(
     public SaslInitiationRuntimeConfig(SaslInitiationConfig config,
                                        KeyStoreCredentialStore credentialStore,
                                        IdentitySelector identitySelector) {
-        this(config, credentialStore, identitySelector, new CredentialResolver(credentialStore));
+        this(config, credentialStore, identitySelector, new CredentialResolver(credentialStore), null);
+    }
+
+    /**
+     * Creates a runtime configuration without an OAuth token service.
+     *
+     * @param config the validated plugin configuration
+     * @param credentialStore the loaded credential store
+     * @param identitySelector the identity selector
+     * @param credentialResolver the credential resolver
+     */
+    public SaslInitiationRuntimeConfig(SaslInitiationConfig config,
+                                       KeyStoreCredentialStore credentialStore,
+                                       IdentitySelector identitySelector,
+                                       CredentialResolver credentialResolver) {
+        this(config, credentialStore, identitySelector, credentialResolver, null);
     }
 
     /**
@@ -49,7 +69,6 @@ public record SaslInitiationRuntimeConfig(
      */
     public SaslInitiationRuntimeConfig {
         Objects.requireNonNull(config, "config");
-        Objects.requireNonNull(credentialStore, "credentialStore");
         Objects.requireNonNull(identitySelector, "identitySelector");
         Objects.requireNonNull(credentialResolver, "credentialResolver");
     }

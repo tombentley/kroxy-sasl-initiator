@@ -17,7 +17,6 @@ import javax.security.sasl.SaslException;
 import org.apache.kafka.common.security.scram.internals.ScramSaslClientProvider;
 
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.config.Mechanism;
-import com.github.tombentley.kroxylicious.filter.sasl.initiation.credentials.PasswordCredential;
 
 /**
  * A mechanism driver for SASL mechanisms that use the JDK's or Kafka's password-based client implementations.
@@ -46,7 +45,7 @@ final class PasswordMechanismDriver implements MechanismDriver {
     }
 
     @Override
-    public SaslClient createSaslClient(PasswordCredential credential, CallbackHandler callbackHandler) throws SaslException {
+    public SaslClient createSaslClient(CallbackHandler callbackHandler) throws SaslException {
         Map<String, Object> configs = Map.of();
         SaslClient client = Sasl.createSaslClient(
                 new String[]{ mechanism.mechanismName() },

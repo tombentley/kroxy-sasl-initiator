@@ -20,10 +20,13 @@ import java.util.Set;
 import javax.crypto.spec.SecretKeySpec;
 
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.credentials.CredentialEntryCodec;
+import com.github.tombentley.kroxylicious.filter.sasl.initiation.credentials.OAuthCredentialEntry;
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.credentials.PasswordCredentialEntry;
 import com.github.tombentley.kroxylicious.filter.sasl.initiation.credentials.SubjectAlias;
 
 import io.kroxylicious.proxy.config.secret.PasswordProvider;
+
+import edu.umd.cs.findbugs.annotations.Nullable;
 
 /**
  * Test helpers for creating PKCS12 credential stores.
@@ -44,6 +47,16 @@ final class TestStores {
      * @param password the broker password
      */
     record PasswordEntry(String subject, String username, String password) {}
+
+    /**
+     * An OAuth entry to write to a test store.
+     *
+     * @param subject the lookup subject
+     * @param clientId the OAuth client id
+     * @param clientSecret the OAuth client secret
+     * @param expectedSubject the expected token subject, or {@code null} to default to the entry subject
+     */
+    record OAuthEntry(String subject, String clientId, String clientSecret, @Nullable String expectedSubject) {}
 
     static PasswordProvider passwordProvider(String password) {
         return () -> password;
@@ -68,6 +81,35 @@ final class TestStores {
             keyStore.load(null, password);
             for (PasswordEntry entry : entries) {
                 byte[] json = passwordEntryJson(entry.subject(), entry.username(), entry.password());
+                keyStore.setEntry(SubjectAlias.hash(entry.subject()),
+                        new KeyStore.SecretKeyEntry(new SecretKeySpec(json, "AES")),
+                        protection);
+                Arrays.fill(json, (byte) 0);
+            }
+            writeStore(keyStore, file, password);
+        }
+        finally {
+            protection.destroy();
+            Arrays.fill(password, '\0');
+        }
+    }
+
+    static void writeOAuthStore(Path file, String... subjects) throws Exception {
+        OAuthEntry[] entries = Arrays.stream(subjects)
+                .map(subject -> new OAuthEntry(subject, subject + "-client", BROKER_PASSWORD, subject))
+                .toArray(OAuthEntry[]::new);
+        writeOAuthStore(file, entries);
+    }
+
+    static void writeOAuthStore(Path file, OAuthEntry... entries) throws Exception {
+        KeyStore keyStore = KeyStore.getInstance("PKCS12");
+        char[] password = STORE_PASSWORD.toCharArray();
+        KeyStore.PasswordProtection protection = new KeyStore.PasswordProtection(password);
+        try {
+            keyStore.load(null, password);
+            for (OAuthEntry entry : entries) {
+                byte[] json = CredentialEntryCodec.encode(new OAuthCredentialEntry(1, entry.subject(),
+                        new OAuthCredentialEntry.OAuthBearer(entry.clientId(), entry.clientSecret(), entry.expectedSubject())));
                 keyStore.setEntry(SubjectAlias.hash(entry.subject()),
                         new KeyStore.SecretKeyEntry(new SecretKeySpec(json, "AES")),
                         protection);
