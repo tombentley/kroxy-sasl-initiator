@@ -44,6 +44,12 @@ jobs:
           server-id: central
           server-username-env-var: CENTRAL_TOKEN_USERNAME
           server-password-env-var: CENTRAL_TOKEN_PASSWORD
+          # Maven 3.10+ scopes server credentials to the origins of repositories
+          # declared with the same id. The id "central" is implicitly bound to
+          # repo.maven.apache.org (Maven Central), so without this the token is
+          # not sent to the Central Portal snapshot repository (central.sonatype.com).
+          mvn-server-repository-origins: |
+            central:https://central.sonatype.com
 
       - name: Determine project version
         id: version
