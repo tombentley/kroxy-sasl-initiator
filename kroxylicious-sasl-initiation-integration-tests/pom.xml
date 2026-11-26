@@ -12,7 +12,7 @@
     <modelVersion>4.0.0</modelVersion>
 
     <parent>
-        <groupId>com.github.tombentley.kroxylicious.sasl</groupId>
+        <groupId>io.github.tombentley.kroxylicious.sasl</groupId>
         <artifactId>kroxylicious-sasl-initiation-parent</artifactId>
         <version>0.1.0-SNAPSHOT</version>
     </parent>
@@ -21,9 +21,14 @@
     <name>Kroxylicious SASL Initiation Integration Tests</name>
     <description>Integration tests for the SASL initiation filter against a real Kafka cluster.</description>
 
+    <properties>
+        <!-- Test-only module: never publish it to Maven Central. -->
+        <maven.deploy.skip>true</maven.deploy.skip>
+    </properties>
+
     <dependencies>
         <dependency>
-            <groupId>com.github.tombentley.kroxylicious.sasl</groupId>
+            <groupId>io.github.tombentley.kroxylicious.sasl</groupId>
             <artifactId>kroxylicious-sasl-initiation</artifactId>
             <version>${project.version}</version>
             <scope>test</scope>

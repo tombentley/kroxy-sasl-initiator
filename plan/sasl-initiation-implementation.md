@@ -101,7 +101,7 @@ kroxylicious-sasl-initiation-parent
 └── kroxylicious-sasl-initiation-system-tests  # Black-box system tests (later)
 ```
 
-Suggested group ID: `com.github.tombentley.kroxylicious.sasl`; version `0.1.0-SNAPSHOT` during development. The filter jar is
+Suggested group ID: `io.github.tombentley.kroxylicious.sasl`; version `0.1.0-SNAPSHOT` during development. The filter jar is
 `kroxylicious-sasl-initiation-0.1.0.jar`. The CLI is `sasl-initiation-credential-tool`.
 
 Java packages:
@@ -476,7 +476,7 @@ project for a standalone Kroxylicious SASL initiation plugin.
 
 Requirements:
 - Java release 21, Maven 3.9+.
-- Parent `kroxylicious-sasl-initiation-parent`, groupId `com.github.tombentley.kroxylicious.sasl`, version `0.1.0-SNAPSHOT`.
+- Parent `kroxylicious-sasl-initiation-parent`, groupId `io.github.tombentley.kroxylicious.sasl`, version `0.1.0-SNAPSHOT`.
 - Modules: `kroxylicious-sasl-initiation-credentials`, `kroxylicious-sasl-initiation`,
   `kroxylicious-sasl-initiation-credential-tool`, `kroxylicious-sasl-initiation-integration-tests`.
 - Import `io.kroxylicious:kroxylicious-bom:0.26.0` in dependencyManagement. Pin `org.apache.kafka:kafka-clients:4.3.2`,

@@ -1,0 +1,62 @@
+#
+# Copyright Kroxylicious Authors.
+#
+# Licensed under the Apache Software License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
+#
+
+name: Publish snapshot
+
+# Publishes the current -SNAPSHOT to the Central Portal snapshot repository on
+# every push to main. No-op if the version is not a snapshot (for example right
+# after a release, before the next development version is committed).
+#
+# Requires snapshot publishing to be enabled for the namespace:
+# https://central.sonatype.com/publishing/namespaces
+#
+# Secrets required:
+#   CENTRAL_TOKEN_USERNAME - Sonatype Central user token username
+#   CENTRAL_TOKEN_PASSWORD - Sonatype Central user token password
+
+on:
+  push:
+    branches: [ main ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish-snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Java
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+          server-id: central
+          server-username-env-var: CENTRAL_TOKEN_USERNAME
+          server-password-env-var: CENTRAL_TOKEN_PASSWORD
+
+      - name: Determine project version
+        id: version
+        run: echo "version=$(mvn --quiet help:evaluate -Dexpression=project.version -DforceStdout)" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy snapshot
+        if: endsWith(steps.version.outputs.version, '-SNAPSHOT')
+        env:
+          CENTRAL_TOKEN_USERNAME: ${{ secrets.CENTRAL_TOKEN_USERNAME }}
+          CENTRAL_TOKEN_PASSWORD: ${{ secrets.CENTRAL_TOKEN_PASSWORD }}
+        run: >-
+          mvn --batch-mode --no-transfer-progress
+          -DskipUTs=true
+          -DskipITs=true
+          -pl '!kroxylicious-sasl-initiation-integration-tests'
+          deploy
