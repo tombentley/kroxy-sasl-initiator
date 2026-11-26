@@ -36,8 +36,33 @@ clients `4.3.2`, Kafka brokers `4.0+` and Java 21.
 | `kroxylicious-sasl-initiation-integration-tests` | Integration tests against real Kafka brokers. |
 
 The parent project is `kroxylicious-sasl-initiation-parent`
-(`com.github.tombentley.kroxylicious.sasl:0.1.0-SNAPSHOT`). The Kroxylicious parent POM is
+(`io.github.tombentley.kroxylicious.sasl:0.1.0-SNAPSHOT`). The Kroxylicious parent POM is
 deliberately not used, so the build is self-contained.
+
+## Maven Central
+
+Release artifacts are published to Maven Central under the `io.github.tombentley.kroxylicious.sasl`
+groupId. The parent POM, credentials module, filter plugin and credential tool are published; the
+integration-tests module is not.
+
+To consume the filter from a Maven build:
+
+```xml
+<dependency>
+    <groupId>io.github.tombentley.kroxylicious.sasl</groupId>
+    <artifactId>kroxylicious-sasl-initiation</artifactId>
+    <version>0.1.0</version>
+</dependency>
+```
+
+The filter depends on `kroxylicious-sasl-initiation-credentials`, which Maven resolves
+transitively. The CLI is published as
+`io.github.tombentley.kroxylicious.sasl:kroxylicious-sasl-initiation-credential-tool`. The filter
+and the CLI declare their Kroxylicious, Kafka, Jackson and SLF4J dependencies as `provided` because
+the Kroxylicious runtime supplies them.
+
+See [.github/README.md](.github/README.md) for the one-time publishing setup and the release
+workflow.
 
 ## Quick start
 
