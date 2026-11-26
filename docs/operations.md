@@ -76,7 +76,7 @@ mvn -q -DskipTests -DskipITs install
 mvn -q -pl kroxylicious-sasl-initiation-credential-tool \
   dependency:build-classpath -Dmdep.outputFile=target/cli-classpath.txt
 java -cp "kroxylicious-sasl-initiation-credential-tool/target/kroxylicious-sasl-initiation-credential-tool-0.1.0-SNAPSHOT-all.jar:$(cat kroxylicious-sasl-initiation-credential-tool/target/cli-classpath.txt)" \
-  com.github.tombentley.kroxylicious.filter.sasl.initiation.cli.SaslInitiationCredentialTool --help
+  io.github.tombentley.kroxylicious.filter.sasl.initiation.cli.SaslInitiationCredentialTool --help
 ```
 
 The rest of this page uses `sasl-initiation-credential-tool` as the launcher name.

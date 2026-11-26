@@ -49,7 +49,7 @@ These apply to every commit:
 
 * Target the released Kroxylicious API baseline in §2.1. Do not use `0.27.0-SNAPSHOT` unless this plan is explicitly
   updated.
-* The filter type is `SaslInitiation`. The Java package root is `com.github.tombentley.kroxylicious.filter.sasl.initiation`.
+* The filter type is `SaslInitiation`. The Java package root is `io.github.tombentley.kroxylicious.filter.sasl.initiation`.
 * Use the IANA SASL mechanism names exactly: `PLAIN`, `SCRAM-SHA-256`, `SCRAM-SHA-512`, `OAUTHBEARER`.
 * Delegate mechanism work to Kafka/JDK SASL clients. Do not reimplement PLAIN, SCRAM or OAUTHBEARER framing.
 * Never log or include in exceptions: passwords, OAuth client secrets, bearer tokens, SASL auth bytes, or raw broker
@@ -107,14 +107,14 @@ Suggested group ID: `io.github.tombentley.kroxylicious.sasl`; version `0.1.0-SNA
 Java packages:
 
 ```text
-com.github.tombentley.kroxylicious.filter.sasl.initiation               # SaslInitiation factory, filter, state machine
-com.github.tombentley.kroxylicious.filter.sasl.initiation.config        # config records, mechanism/identity enums
-com.github.tombentley.kroxylicious.filter.sasl.initiation.credentials   # KeyStore store, entries, secrets, permissions
-com.github.tombentley.kroxylicious.filter.sasl.initiation.identity      # fixed/subject selectors, snapshot adapter
-com.github.tombentley.kroxylicious.filter.sasl.initiation.mechanism     # SASL client drivers and callback handlers
-com.github.tombentley.kroxylicious.filter.sasl.initiation.oauth         # token service, cache, retrievers/validators
-com.github.tombentley.kroxylicious.filter.sasl.initiation.metrics       # Micrometer metrics and log keys
-com.github.tombentley.kroxylicious.filter.sasl.initiation.cli           # CLI (in the tool module)
+io.github.tombentley.kroxylicious.filter.sasl.initiation               # SaslInitiation factory, filter, state machine
+io.github.tombentley.kroxylicious.filter.sasl.initiation.config        # config records, mechanism/identity enums
+io.github.tombentley.kroxylicious.filter.sasl.initiation.credentials   # KeyStore store, entries, secrets, permissions
+io.github.tombentley.kroxylicious.filter.sasl.initiation.identity      # fixed/subject selectors, snapshot adapter
+io.github.tombentley.kroxylicious.filter.sasl.initiation.mechanism     # SASL client drivers and callback handlers
+io.github.tombentley.kroxylicious.filter.sasl.initiation.oauth         # token service, cache, retrievers/validators
+io.github.tombentley.kroxylicious.filter.sasl.initiation.metrics       # Micrometer metrics and log keys
+io.github.tombentley.kroxylicious.filter.sasl.initiation.cli           # CLI (in the tool module)
 ```
 
 ### 2.3 API facts the implementation must account for
@@ -162,7 +162,7 @@ with the package-level defaults:
 @ReturnValuesAreNonnullByDefault
 @DefaultAnnotationForParameters(NonNull.class)
 @DefaultAnnotation(NonNull.class)
-package com.github.tombentley.kroxylicious.filter.sasl.initiation.example;
+package io.github.tombentley.kroxylicious.filter.sasl.initiation.example;
 
 import edu.umd.cs.findbugs.annotations.DefaultAnnotation;
 import edu.umd.cs.findbugs.annotations.DefaultAnnotationForParameters;
@@ -490,12 +490,12 @@ Requirements:
 - Configure Surefire for `*Test`, Failsafe for `*IT`, with JUnit 5. Configure the formatter/import-sort/license/checkstyle
   plugins following Kroxylicious conventions. Keep the configuration self-contained; do not depend on the Kroxylicious
   parent POM.
-- Add a `SaslInitiation` class in `com.github.tombentley.kroxylicious.filter.sasl.initiation` annotated with
+- Add a `SaslInitiation` class in `io.github.tombentley.kroxylicious.filter.sasl.initiation` annotated with
   `@Plugin(configType = SaslInitiationConfig.class)`. `SaslInitiationConfig` is a record with a required `mechanism`
   String for now; validate it is non-empty. `initialize` returns the config. `createFilter` returns a filter that
   forwards every request and every response unchanged.
 - Register the factory in `src/main/resources/META-INF/services/io.kroxylicious.proxy.filter.FilterFactory` as
-  `com.github.tombentley.kroxylicious.filter.sasl.initiation.SaslInitiation`.
+  `io.github.tombentley.kroxylicious.filter.sasl.initiation.SaslInitiation`.
 - Add a unit test asserting ServiceLoader discovers the factory and `initialize`/`createFilter` work.
 - Add an integration test class `SaslInitiationSmokeIT` using `@ExtendWith(KafkaClusterExtension.class)`,
   `@ExtendWith(NettyLeakDetectorExtension.class)`, a real `KafkaCluster`, `Topic`, `KroxyliciousTesters.kroxyliciousTester`,
@@ -568,7 +568,7 @@ Commit 2.
 Implement the credential foundation in module `kroxylicious-sasl-initiation-credentials`.
 
 Requirements:
-- Package `com.github.tombentley.kroxylicious.filter.sasl.initiation.credentials`.
+- Package `io.github.tombentley.kroxylicious.filter.sasl.initiation.credentials`.
 - Define the v1 JSON schema exactly as specified in §6.2 of the implementation plan:
   * password entry: version, subject, username, password.
   * oauth entry: version, subject, oauthBearer {clientId, clientSecret, expectedSubject?}.
@@ -648,7 +648,7 @@ with bare `keytool`.
 Read plan/sasl-initiation.md D9-D12, O2-O3 and plan/sasl-initiation-implementation.md §2, §3.6 and §6 Commit 3.
 
 Implement the CLI in module `kroxylicious-sasl-initiation-credential-tool`, package
-`com.github.tombentley.kroxylicious.filter.sasl.initiation.cli`.
+`io.github.tombentley.kroxylicious.filter.sasl.initiation.cli`.
 
 Use picocli 4.7.x and the credential store from the previous commit. Commands:
 - `create --file <path>`: create a new PKCS12 store. Fail if the file exists. Create with POSIX `rw-------`; use the
@@ -754,7 +754,7 @@ Read plan/sasl-initiation.md §6.5, D6-D8, D24 and plan/sasl-initiation-implemen
 Implement the configuration and identity layer.
 
 Config:
-- Create `SaslInitiationConfig` and nested records in `com.github.tombentley.kroxylicious.filter.sasl.initiation.config`.
+- Create `SaslInitiationConfig` and nested records in `io.github.tombentley.kroxylicious.filter.sasl.initiation.config`.
 - Use Jackson records with `@JsonProperty(required = true)` where appropriate and canonical-constructor validation.
 - The YAML shape is exactly the one in §6.5 of the implementation plan, but `mechanism` is limited to PLAIN,
   SCRAM-SHA-256 and SCRAM-SHA-512 for this commit. OAUTHBEARER is added later.
@@ -771,7 +771,7 @@ Config:
   messages. Never include passwords.
 
 Identity:
-- Create `IdentitySelector` in `com.github.tombentley.kroxylicious.filter.sasl.initiation.identity`.
+- Create `IdentitySelector` in `io.github.tombentley.kroxylicious.filter.sasl.initiation.identity`.
 - `FixedIdentitySelector` returns the configured key.
 - `SubjectIdentitySelector` reads `FilterContext.authenticatedSubject()` at request time. It must fail closed if the
   subject is anonymous, if no principal of the configured type is present, or if more than one is present.
@@ -1210,7 +1210,7 @@ Config:
   implement `org.apache.kafka.common.security.oauthbearer.JwtRetriever`; subjectClaimName non-empty.
 
 Token service:
-- Package `com.github.tombentley.kroxylicious.filter.sasl.initiation.oauth`.
+- Package `io.github.tombentley.kroxylicious.filter.sasl.initiation.oauth`.
 - `OAuthTokenService` per factory initialization data. Per identity, instantiate and configure a `JwtRetriever`
   (default `DefaultJwtRetriever`) and a `JwtValidator` (`DefaultJwtValidator`/`ClientJwtValidator`).
 - For fixed file-token mode, use `FileJwtRetriever` and no KeyStore entry; trust the file.

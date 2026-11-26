@@ -78,7 +78,7 @@ mvn -q -pl kroxylicious-sasl-initiation-credential-tool \
 
 sasl-initiation-credential-tool() {
   java -cp "kroxylicious-sasl-initiation-credential-tool/target/kroxylicious-sasl-initiation-credential-tool-0.1.0-SNAPSHOT-all.jar:$(cat kroxylicious-sasl-initiation-credential-tool/target/cli-classpath.txt)" \
-    com.github.tombentley.kroxylicious.filter.sasl.initiation.cli.SaslInitiationCredentialTool "$@"
+    io.github.tombentley.kroxylicious.filter.sasl.initiation.cli.SaslInitiationCredentialTool "$@"
 }
 ```
 
