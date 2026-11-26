@@ -47,6 +47,17 @@ never deployed.
 - **release.yaml** — manual: **Actions → Release → Run workflow**. It takes `release-version` and
   `next-version` inputs, then sets the release version, builds/signs/publishes it to Central, tags
   it, creates a GitHub release, sets the next `-SNAPSHOT` version, and pushes everything.
+- **dco.yaml** — on every pull request, checks that every non-merge commit has a `Signed-off-by`
+  trailer matching the commit author or committer. To make sign-off mandatory, add the
+  **Check commit sign-offs** job as a required status check under **Settings → Branches** for
+  `main`.
+
+## Developer Certificate of Origin
+
+Contributions must be signed off under the [Developer Certificate of Origin](https://developercertificate.org/).
+Create signed-off commits with `git commit --signoff`; to sign off an existing branch, run
+`git rebase --signoff <base-branch>`. To sign off every commit automatically, set
+`git config format.signOff true`. Dependabot commits are exempt.
 
 ## First release
 

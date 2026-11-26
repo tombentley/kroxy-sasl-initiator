@@ -1,0 +1,96 @@
+#
+# Copyright Kroxylicious Authors.
+#
+# Licensed under the Apache Software License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
+#
+
+name: DCO
+
+# Checks that every non-merge commit in a pull request carries a
+# `Signed-off-by` trailer matching the commit's author or committer, as
+# required by the Developer Certificate of Origin (https://developercertificate.org/).
+#
+# To enforce this, add the "Check commit sign-offs" job as a required status
+# check in the branch protection rules for `main`.
+
+on:
+  pull_request:
+  merge_group:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  signoff:
+    name: Check commit sign-offs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The full history is needed to inspect every commit in the PR.
+          fetch-depth: 0
+
+      - name: Verify Signed-off-by trailers
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+        run: |
+          set -euo pipefail
+
+          range_start=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
+
+          missing=()
+          checked=0
+
+          while IFS= read -r commit; do
+            author_email=$(git show -s --format='%ae' "$commit")
+            committer_email=$(git show -s --format='%ce' "$commit")
+            subject=$(git show -s --format='%s' "$commit")
+
+            # Dependabot does not sign off its commits, so exempt it.
+            case "${author_email,,}" in
+              "49699333+dependabot[bot]@users.noreply.github.com"|"support@dependabot.com")
+                echo "Skipping Dependabot commit $commit."
+                continue
+                ;;
+            esac
+
+            checked=$((checked + 1))
+
+            signed_off=0
+            while IFS= read -r trailer; do
+              email=$(printf '%s\n' "$trailer" | sed -n 's/.*<\(.*\)>.*/\1/p')
+              if [ -n "$email" ] && \
+                 { [ "${email,,}" = "${author_email,,}" ] || [ "${email,,}" = "${committer_email,,}" ]; }; then
+                signed_off=1
+                break
+              fi
+            done < <(git show -s --format='%(trailers:key=Signed-off-by,valueonly)' "$commit")
+
+            if [ "$signed_off" -ne 1 ]; then
+              missing+=("$commit $subject")
+              echo "::error::Commit $commit (\"$subject\") is missing a Signed-off-by trailer matching $author_email."
+            fi
+          done < <(git rev-list --no-merges "$range_start..$HEAD_SHA")
+
+          if [ "${#missing[@]}" -gt 0 ]; then
+            {
+              echo "## DCO check failed"
+              echo
+              echo "The following commits are missing a \`Signed-off-by\` trailer:"
+              echo
+              for entry in "${missing[@]}"; do
+                echo "- \`$entry\`"
+              done
+              echo
+              echo "Sign off new commits with \`git commit --signoff\`, or sign off an existing branch with \`git rebase --signoff <base>\`."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          echo "All $checked non-merge commit(s) are signed off."
