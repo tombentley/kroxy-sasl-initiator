@@ -68,7 +68,7 @@
         <!-- Kroxylicious baseline -->
         <kroxylicious.version>0.26.0</kroxylicious.version>
         <kroxylicious.extension.version>0.16.0</kroxylicious.extension.version>
-        <kafka.version>4.3.2</kafka.version>
+        <kafka.version>4.4.0</kafka.version>
 
         <!-- Third-party versions -->
         <junit.version>5.14.4</junit.version>
