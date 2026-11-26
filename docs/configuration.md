@@ -1,7 +1,7 @@
 # Configuration reference
 
 The filter type is `SaslInitiation`. Its configuration record is
-`com.github.tombentley.kroxylicious.filter.sasl.initiation.config.SaslInitiationConfig`.
+`io.github.tombentley.kroxylicious.filter.sasl.initiation.config.SaslInitiationConfig`.
 
 ## Shape
 

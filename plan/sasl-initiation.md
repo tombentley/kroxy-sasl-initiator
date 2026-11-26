@@ -628,7 +628,7 @@ The following were agreed on 2026-11-24:
 
 **Question:** `SaslInitiation` vs `SaslInitiator`; package/artifact names; config key names.
 
-**Recommendation:** `SaslInitiation` (consistent with `SaslTermination`), package `com.github.tombentley.kroxylicious.filter.sasl.initiation`, artifact `kroxylicious-sasl-initiation` if upstream. Use "initiation" for the concept and "initiator" only in prose if needed.
+**Recommendation:** `SaslInitiation` (consistent with `SaslTermination`), package `io.github.tombentley.kroxylicious.filter.sasl.initiation`, artifact `kroxylicious-sasl-initiation` if upstream. Use "initiation" for the concept and "initiator" only in prose if needed.
 
 **Decision (2026-11-24):** Use `SaslInitiation` for the filter type, module, and documentation.
 

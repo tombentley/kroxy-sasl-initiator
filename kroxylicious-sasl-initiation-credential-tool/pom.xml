@@ -98,7 +98,7 @@
                             </artifactSet>
                             <transformers>
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
-                                    <mainClass>com.github.tombentley.kroxylicious.filter.sasl.initiation.cli.SaslInitiationCredentialTool</mainClass>
+                                    <mainClass>io.github.tombentley.kroxylicious.filter.sasl.initiation.cli.SaslInitiationCredentialTool</mainClass>
                                     <manifestEntries>
                                         <Implementation-Title>${project.name}</Implementation-Title>
                                         <Implementation-Version>${project.version}</Implementation-Version>
