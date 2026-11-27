@@ -83,6 +83,7 @@
         <netty-leak-detector.version>0.2.2</netty-leak-detector.version>
         <awaitility.version>4.3.0</awaitility.version>
         <testcontainers.version>2.0.5</testcontainers.version>
+        <commons-compress.version>1.28.0</commons-compress.version>
         <failsafe.excludedGroups>docker</failsafe.excludedGroups>
 
         <!-- Maven plugin versions -->
@@ -197,6 +198,11 @@
                 <groupId>org.testcontainers</groupId>
                 <artifactId>testcontainers</artifactId>
                 <version>${testcontainers.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.apache.commons</groupId>
+                <artifactId>commons-compress</artifactId>
+                <version>${commons-compress.version}</version>
             </dependency>
             <dependency>
                 <groupId>org.slf4j</groupId>
@@ -697,6 +703,16 @@
                     </plugin>
                 </plugins>
             </build>
+        </profile>
+        <profile>
+            <id>system-tests</id>
+            <!--
+                Black-box system tests run the packaged Kroxylicious proxy against a Testcontainers Kafka broker.
+                The module is not part of the default reactor so that `mvn verify` never needs Docker.
+            -->
+            <modules>
+                <module>kroxylicious-sasl-initiation-system-tests</module>
+            </modules>
         </profile>
     </profiles>
 </project>

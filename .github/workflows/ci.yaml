@@ -10,6 +10,11 @@ on:
   push:
     branches: [ main ]
   pull_request:
+  schedule:
+    # Nightly packaged-proxy system tests. They need Docker and download the
+    # Kroxylicious release distribution, so they do not run on every push.
+    - cron: '0 3 * * *'
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -21,6 +26,7 @@ permissions:
 jobs:
   build:
     name: Maven verify
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -38,6 +44,7 @@ jobs:
 
   integration-docker:
     name: Docker integration tests
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -61,4 +68,33 @@ jobs:
           -Dfailsafe.failIfNoSpecifiedTests=false
           -Dit.test=SaslOauthBearerInitiationIT
           -pl kroxylicious-sasl-initiation-integration-tests -am
+          verify
+
+  system-tests:
+    name: Packaged proxy system tests
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Java
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Show Docker version
+        run: docker version
+
+      - name: Run packaged proxy system tests
+        run: >-
+          mvn --batch-mode --no-transfer-progress
+          -Psystem-tests
+          -DskipUTs=true
+          -DskipITs=false
+          -Dfailsafe.excludedGroups=
+          -pl kroxylicious-sasl-initiation-system-tests -am
           verify
