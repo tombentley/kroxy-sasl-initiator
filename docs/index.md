@@ -15,6 +15,7 @@ Start here:
 | [Security](security.md) | PLAIN over plaintext, KeyStore custody, JVM heap exposure, subject trust, generic errors and log hygiene. |
 | [Failure semantics and observability](observability.md) | Client-visible failures, metrics, structured log keys and troubleshooting. |
 | [Migration from `SaslPlainInitiation`](migration.md) | Moving from the test-only filter to the production filter. |
+| [Packaged proxy system tests](system-tests.md) | Running the black-box tests against the released distribution, Docker and a real Kafka broker. |
 | [Examples](examples/) | Complete YAML examples for fixed/subject identity, PLAIN/SCRAM/OAUTHBEARER, mTLS and routing. |
 
 ## First-release scope

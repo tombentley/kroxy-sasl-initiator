@@ -1,0 +1,137 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+
+    Copyright Kroxylicious Authors.
+
+    Licensed under the Apache Software License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
+
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>io.github.tombentley.kroxylicious.sasl</groupId>
+        <artifactId>kroxylicious-sasl-initiation-parent</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>kroxylicious-sasl-initiation-system-tests</artifactId>
+    <name>Kroxylicious SASL Initiation System Tests</name>
+    <description>Black-box system tests for the packaged SASL initiation plugin.</description>
+
+    <properties>
+        <!-- Test-only module: never publish it to Maven Central. -->
+        <maven.deploy.skip>true</maven.deploy.skip>
+
+        <!--
+            Defaults for the packaged distribution. The checksum is the SHA-256 of
+            kroxylicious-app-0.26.0-bin.tar.gz from the GitHub release. Override
+            kroxylicious.distribution to use a local tar.gz or an unpacked directory.
+        -->
+        <kroxylicious.distribution></kroxylicious.distribution>
+        <kroxylicious.distribution.sha256>7231383db9bb72434a734c0658b1daf5d24898be82c632e11ffafed6ed436d9c</kroxylicious.distribution.sha256>
+
+        <!-- Kafka broker image. Override both or either of these for a compatibility run. -->
+        <kafka.container.version>${kafka.version}</kafka.container.version>
+        <kafka.container.image></kafka.container.image>
+    </properties>
+
+    <dependencies>
+        <!--
+            The system tests deliberately do not link against production classes. These
+            dependencies only establish reactor build order so that the jars copied into
+            classpath-plugins/sasl-initiation/ are current.
+        -->
+        <dependency>
+            <groupId>io.github.tombentley.kroxylicious.sasl</groupId>
+            <artifactId>kroxylicious-sasl-initiation</artifactId>
+            <version>${project.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.github.tombentley.kroxylicious.sasl</groupId>
+            <artifactId>kroxylicious-sasl-initiation-credentials</artifactId>
+            <version>${project.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.github.tombentley.kroxylicious.sasl</groupId>
+            <artifactId>kroxylicious-sasl-initiation-credential-tool</artifactId>
+            <version>${project.version}</version>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- Containerised Kafka broker -->
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.commons</groupId>
+            <artifactId>commons-compress</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.kafka</groupId>
+            <artifactId>kafka-clients</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- Test libraries -->
+        <dependency>
+            <groupId>com.github.spotbugs</groupId>
+            <artifactId>spotbugs-annotations</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.assertj</groupId>
+            <artifactId>assertj-core</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.awaitility</groupId>
+            <artifactId>awaitility</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.logging.log4j</groupId>
+            <artifactId>log4j-slf4j2-impl</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-failsafe-plugin</artifactId>
+                <configuration>
+                    <skipITs>${skipITs}</skipITs>
+                    <includes>
+                        <include>**/*SystemIT.java</include>
+                    </includes>
+                    <systemPropertyVariables>
+                        <sasl.system.test.work.dir>${project.build.directory}</sasl.system.test.work.dir>
+                        <sasl.initiation.filter.jar>${project.basedir}/../kroxylicious-sasl-initiation/target/kroxylicious-sasl-initiation-${project.version}.jar</sasl.initiation.filter.jar>
+                        <sasl.initiation.credentials.jar>${project.basedir}/../kroxylicious-sasl-initiation-credentials/target/kroxylicious-sasl-initiation-credentials-${project.version}.jar</sasl.initiation.credentials.jar>
+                        <sasl.initiation.cli.jar>${project.basedir}/../kroxylicious-sasl-initiation-credential-tool/target/kroxylicious-sasl-initiation-credential-tool-${project.version}.jar</sasl.initiation.cli.jar>
+                        <sasl.initiation.cli.all.jar>${project.basedir}/../kroxylicious-sasl-initiation-credential-tool/target/kroxylicious-sasl-initiation-credential-tool-${project.version}-all.jar</sasl.initiation.cli.all.jar>
+                        <kroxylicious.version>${kroxylicious.version}</kroxylicious.version>
+                        <kroxylicious.distribution>${kroxylicious.distribution}</kroxylicious.distribution>
+                        <kroxylicious.distribution.sha256>${kroxylicious.distribution.sha256}</kroxylicious.distribution.sha256>
+                        <kafka.container.version>${kafka.container.version}</kafka.container.version>
+                        <kafka.container.image>${kafka.container.image}</kafka.container.image>
+                    </systemPropertyVariables>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>

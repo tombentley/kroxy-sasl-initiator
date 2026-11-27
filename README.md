@@ -17,6 +17,7 @@ clients `4.3.2`, Kafka brokers `4.0+` and Java 21.
 * [Security](docs/security.md)
 * [Failure semantics and observability](docs/observability.md)
 * [Migration from the test-only `SaslPlainInitiation`](docs/migration.md)
+* [Packaged proxy system tests](docs/system-tests.md)
 * [Example YAML files](docs/examples/)
 
 ## Requirements
@@ -34,6 +35,7 @@ clients `4.3.2`, Kafka brokers `4.0+` and Java 21.
 | `kroxylicious-sasl-initiation` | The `SaslInitiation` filter plugin and its configuration. |
 | `kroxylicious-sasl-initiation-credential-tool` | CLI for creating and maintaining initiation credentials. |
 | `kroxylicious-sasl-initiation-integration-tests` | Integration tests against real Kafka brokers. |
+| `kroxylicious-sasl-initiation-system-tests` | Black-box tests of the packaged proxy, Docker Kafka and the CLI. |
 
 The parent project is `kroxylicious-sasl-initiation-parent`
 (`io.github.tombentley.kroxylicious.sasl:0.1.0-SNAPSHOT`). The Kroxylicious parent POM is
@@ -43,7 +45,7 @@ deliberately not used, so the build is self-contained.
 
 Release artifacts are published to Maven Central under the `io.github.tombentley.kroxylicious.sasl`
 groupId. The parent POM, credentials module, filter plugin and credential tool are published; the
-integration-tests module is not.
+integration-tests and system-tests modules are not.
 
 To consume the filter from a Maven build:
 
@@ -253,6 +255,24 @@ The integration tests use the in-VM Kafka broker from
 [`kroxylicious-testing`](https://github.com/kroxylicious/kroxylicious-junit5-extension), so Docker is
 not required for the plaintext smoke test. Pass `-DskipITs=true` to skip integration tests, or
 `-DskipUTs=true` to skip unit tests.
+
+### System tests
+
+The black-box system tests run the packaged Kroxylicious distribution with a Docker Kafka broker.
+They are opt-in and skipped by default:
+
+```shell
+mvn -Psystem-tests \
+  -pl kroxylicious-sasl-initiation-system-tests -am \
+  -DskipUTs=true \
+  verify
+```
+
+Docker is required. The harness downloads and verifies the pinned Kroxylicious 0.26.0 distribution,
+unpacks it into `target/kroxylicious`, generates a PKCS12 credential store with the CLI, and starts
+the proxy as a subprocess. To use a different Kafka broker version, add
+`-Dkafka.container.version=4.3.1` or `-Dkafka.container.image=...`. See
+[docs/system-tests.md](docs/system-tests.md) for the local distribution and troubleshooting options.
 
 ## License
 
